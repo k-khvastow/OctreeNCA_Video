@@ -13,6 +13,10 @@ from src.utils.helper import dump_json_file, load_json_file, dump_pickle_file, l
 #from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset
 import torch.nn as nn
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from src.utils.ProjectConfiguration import ProjectConfiguration as pc
 from aim import Run, Image, Figure, Distribution
@@ -62,6 +66,13 @@ class Experiment():
         print(json.dumps(self.config, indent=4))
         print("-------- Experiment Setup --------\n")
 
+        self.use_wandb = self.config.get('experiment.use_wandb', False)
+        if self.use_wandb and wandb is None:
+            print("Warning: wandb not installed but use_wandb is True")
+            self.use_wandb = False
+        
+        if self.use_wandb and self.currentStep == 0:
+             self.init_wandb()
 
         #self.initializeFID()
         self.currentStep = self.currentStep+1
@@ -99,6 +110,17 @@ class Experiment():
         self.set_model_state("train")
         self.data_split.save_to_file(os.path.join(pc.FILER_BASE_PATH, self.config['experiment.model_path'], 'data_split.pkl'))
         dump_json_file(self.config, os.path.join(pc.FILER_BASE_PATH, self.config['experiment.model_path'], 'config.json'))
+
+    def init_wandb(self):
+        if not self.use_wandb: return
+        wandb.init(
+            project=self.config.get('experiment.wandb_project', 'OctreeNCA'),
+            entity=self.config.get('experiment.wandb_entity', None),
+            name=self.config['experiment.name'],
+            config=self.config,
+            id=self.run.hash if self.run else None,
+            resume="allow"
+        )
 
     def new_datasplit(self) -> 'DataSplit':
         split_file = self.config.get('experiment.dataset.split_file', None)
@@ -189,6 +211,10 @@ class Experiment():
             
 
         self.load_model()
+        
+        self.use_wandb = self.config.get('experiment.use_wandb', False)
+        if self.use_wandb and wandb is not None:
+             self.init_wandb()
     
     def load_model(self) -> None:
         pretrained = False
@@ -438,6 +464,8 @@ class Experiment():
         #self.writer.add_scalar(tag, value, step)
         
         self.run.track(step=step, value=value, name=tag)
+        if self.use_wandb:
+            wandb.log({tag: value}, step=step)
 
     def write_img(self, tag: str, image: np.ndarray, step: int, context: dict = {}, normalize: bool = False) -> None:
         r"""Write an image to tensorboard
@@ -456,6 +484,9 @@ class Experiment():
         #image = PILImage(image)
         aim_image = Image(image=image, optimize=True, quality=50)
         self.run.track(step=step, value=aim_image, name=tag, context=context)
+        
+        if self.use_wandb:
+            wandb.log({tag: wandb.Image(image, caption=tag)}, step=step)
 
     def write_text(self, tag: str, text: str, step: int) -> None:
         r"""Write text to tensorboard
@@ -468,6 +499,8 @@ class Experiment():
         data = Distribution(data)
         self.run.track(step=step, value=data, name=tag)
         #self.writer.add_histogram(tag, data, step)
+        if self.use_wandb:
+            wandb.log({tag: wandb.Histogram(np_histogram=data)}, step=step)
 
     def write_figure(self, tag: str, figure: figure, step: int) -> None:
         r"""Write a figure to tensorboard images
@@ -475,6 +508,8 @@ class Experiment():
         figure = Figure(figure)
         self.run.track(step=step, value=figure, name=tag)
         #self.writer.add_figure(tag, figure, step)
+        if self.use_wandb:
+            wandb.log({tag: wandb.Image(figure)}, step=step)
 
 
 class DataSplit():
