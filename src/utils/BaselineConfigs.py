@@ -1,8 +1,8 @@
 import torch
-# from src.agents.Agent_M3DNCA_GradAccum import M3DNCAAgentGradientAccum
-# from src.agents.Agent_M3DNCA_superres import M3DNCAAgent_superres
-# from src.agents.Agent_MedNCA_extrapolation import MedNCAAgent_extrapolation
-# from src.agents.Agent_MedSeg3D_slicewise import Agent_MedSeg3D_slicewise
+from src.agents.Agent_M3DNCA_GradAccum import M3DNCAAgentGradientAccum
+from src.agents.Agent_M3DNCA_superres import M3DNCAAgent_superres
+from src.agents.Agent_MedNCA_extrapolation import MedNCAAgent_extrapolation
+from src.agents.Agent_MedSeg3D_slicewise import Agent_MedSeg3D_slicewise
 from src.losses.WeightedLosses import WeightedLosses
 #from src.models.SamWrapper2D import SamWrapper2D
 #from src.models.SamWrapper3D import SamWrapper3D
@@ -21,8 +21,8 @@ from torch.utils.data import Dataset
 # from unet import UNet2D
 # from src.agents.Agent_UNet import UNetAgent
     
-# from src.models.Model_M3DNCA import M3DNCA
-# from src.agents.Agent_M3DNCA_Simple import M3DNCAAgent
+from src.models.Model_M3DNCA import M3DNCA
+from src.agents.Agent_M3DNCA_Simple import M3DNCAAgent
 from src.losses.LossFunctions import DiceFocalLoss
 
 class EXP_M3DNCA(ExperimentWrapper):
@@ -53,8 +53,8 @@ class EXP_M3DNCA(ExperimentWrapper):
 
         return super().createExperiment(config, model, agent, dataset, loss_function)
     
-# from src.models.Model_MedNCA import MedNCA
-# from src.agents.Agent_MedNCA_Simple  import MedNCAAgent
+from src.models.Model_MedNCA import MedNCA
+from src.agents.Agent_MedNCA_Simple  import MedNCAAgent
 
 class EXP_MEDNCA(ExperimentWrapper):
     def createExperiment(self, study_config : dict, detail_config : dict = {}, dataset : Dataset = None):

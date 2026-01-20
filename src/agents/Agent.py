@@ -132,7 +132,16 @@ class BaseAgent():
         out["target_unpatched"] = data["label"]
         loss, loss_ret = loss_f(**out)
 
-        if loss != 0:
+        do_backward = False
+        if isinstance(loss, torch.Tensor):
+            if loss.numel() > 1:
+                loss = loss.mean()
+            if loss.item() != 0:
+                do_backward = True
+        elif loss != 0:
+            do_backward = True
+
+        if do_backward:
             loss.backward()
 
             if self.exp.config['trainer.normalize_gradients'] == "all" or self.exp.config['experiment.logging.track_gradient_norm']:

@@ -121,9 +121,12 @@ class nnUNetSoftDiceLoss(torch.nn.Module):
             self.apply_nonlin = None
         self.smooth = smooth
 
-    def forward(self, x, y, loss_mask=None):
-        #x = einops.rearrange(x, "b h w c -> b c h w")
-        #y = einops.rearrange(y, "b h w c -> b c h w")
+    def forward(self, x=None, y=None, loss_mask=None, logits=None, target=None, **kwargs):
+        if x is None: x = logits
+        if y is None: y = target
+        
+        x = einops.rearrange(x, "b h w c -> b c h w")
+        y = einops.rearrange(y, "b h w c -> b c h w")
         # x: BCHW, y: BCHW
         shp_x = x.shape
 

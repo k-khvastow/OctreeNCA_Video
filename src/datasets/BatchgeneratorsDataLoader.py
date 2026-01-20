@@ -1,5 +1,6 @@
 
 import numpy as np
+import torch
 import collections, inspect, math, random, logging
 from collections import OrderedDict
 
@@ -18,6 +19,8 @@ def my_default_collate(batch):
         '''
         if isinstance(batch[0], np.ndarray):
             return np.stack(batch)
+        elif isinstance(batch[0], torch.Tensor):
+            return torch.stack(batch)
         elif isinstance(batch[0], (int, np.int64)):
             return np.array(batch).astype(np.int32)
         elif isinstance(batch[0], (float, np.float32)):

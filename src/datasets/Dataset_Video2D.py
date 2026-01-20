@@ -5,22 +5,31 @@ import numpy as np
 import scipy.io
 import natsort
 import cv2
+from src.datasets.Dataset_Base import Dataset_Base
 
-class Video2DDataset(Dataset):
-    def __init__(self, data_root, label_root, preload=False, num_classes=8):
+class Video2DDataset(Dataset_Base):
+    def __init__(self, data_root, label_root, preload=False, num_classes=8, transform_mode='resize'):
+        super().__init__()
         """
         Args:
             data_root (str): Root directory containing subdirectories of image sequences (e.g., .../OCT).
             label_root (str): Root directory containing .mat files (e.g., .../GT_Layers).
             preload (bool): If True, load all data into RAM.
             num_classes (int): Number of segmentation classes (output channels).
+            transform_mode (str): 'resize' or 'crop'.
         """
         self.data_root = data_root
         self.label_root = label_root
         self.preload = preload
         self.num_classes = num_classes
+        self.transform_mode = transform_mode
 
-        
+        # Attributes required by Agent_UNet / Agent_MedNCA
+        self.slice = -1 
+        self.delivers_channel_axis = True # We return HWC now
+        self.is_rgb = False # Grayscale images
+
+        self.all_samples = {}
         self.samples = [] # List of dicts: {'folder': str, 'image_name': str, 'frame_index': int}
         
         # 1. Scan for valid data pairs
@@ -44,12 +53,15 @@ class Video2DDataset(Dataset):
                         
                     # Add each image as a separate sample
                     for idx, img_name in enumerate(img_list):
-                        self.samples.append({
+                        sample_id = f"{item}_{idx}"
+                        self.all_samples[sample_id] = {
                             'folder': item,
                             'image_name': img_name,
-                            'frame_index': idx
-                        })
+                            'frame_index': idx,
+                            'id': sample_id
+                        }
         
+        self.samples = list(self.all_samples.values())
         print(f"Found {len(self.samples)} valid 2D samples.")
         
         if len(self.samples) == 0:
@@ -63,6 +75,21 @@ class Video2DDataset(Dataset):
                 self.cache[i] = self.load_sample(i)
                 if i % 100 == 0:
                     print(f"Loaded {i}/{len(self.samples)}")
+
+    def getFilesInPath(self, path: str):
+        """
+        Return a dictionary of all files/samples. 
+        Experiment expects {id: ...}. The values don't matter keenly for splitting as long as keys are consistent.
+        """
+        return self.all_samples
+
+    def setPaths(self, images_path: str, images_list: list, labels_path: str, labels_list: list) -> None:
+        """
+        Called by Experiment to set the active split (train/val/test).
+        """
+        super().setPaths(images_path, images_list, labels_path, labels_list)
+        # Filter samples based on images_list (which contains IDs)
+        self.samples = [self.all_samples[uid] for uid in self.images_list if uid in self.all_samples]
 
     def __len__(self):
         return len(self.samples)
@@ -89,11 +116,33 @@ class Video2DDataset(Dataset):
         if img is None:
              raise RuntimeError(f"Failed to read image: {img_path}")
              
-        # Convert to float32
-        img = img.astype(np.float32)
-        # Normalize? User provided code did not normalize, but typically we want [0,1] or similar
-        # For now, keeping it raw as per user snippet, but converting to tensor requires float/double.
-        
+        # Convert to float32 and normalize
+        img = img.astype(np.float32) / 255.0
+
+        if hasattr(self, 'size') and self.size is not None:
+             target_size = (self.size[1], self.size[0]) # size is (H, W) -> (W, H)
+             
+             if self.transform_mode == 'crop':
+                 # Center crop
+                 h, w = img.shape
+                 th, tw = self.size[0], self.size[1]
+                 x1 = int(round((w - tw) / 2.))
+                 y1 = int(round((h - th) / 2.))
+                 # Handle cases where image is smaller than target
+                 if x1 < 0 or y1 < 0:
+                      # Fallback to resize or pad? User asked for crop from middle.
+                      # Ideally pad. For now, let's just resize if too small, or let array slicing handle it (risky)
+                      # Safest simple approach: Resize if smaller, Crop if larger
+                      if w < tw or h < th:
+                          img = cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR)
+                      else:
+                          img = img[y1:y1+th, x1:x1+tw]
+                 else:
+                     img = img[y1:y1+th, x1:x1+tw]
+             else:
+                 # Resize
+                 img = cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR)
+
         depth, width = img.shape
         
         # 2. Generate Segmentation Mask
@@ -117,22 +166,44 @@ class Video2DDataset(Dataset):
         for i in range(num_layers):
             layer_surface = layers_data[i, frame_idx, :] # (width,)
             layer_surface_expanded = layer_surface.reshape(1, width) # (1, W)
+            layer_surface_expanded = layer_surface.reshape(1, width) # (1, W)
             mask += (y_grid > layer_surface_expanded).astype(np.float32)
+
+        # Resize Mask if self.size is set
+        if hasattr(self, 'size') and self.size is not None:
+             target_size = (self.size[1], self.size[0])
+             
+             if self.transform_mode == 'crop':
+                 # Re-calculate crop coordinates for mask (reuse logic or recompute)
+                 h, w = mask.shape
+                 th, tw = self.size[0], self.size[1]
+                 x1 = int(round((w - tw) / 2.))
+                 y1 = int(round((h - th) / 2.))
+                 
+                 if w < tw or h < th:
+                      mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
+                 else:
+                      mask = mask[y1:y1+th, x1:x1+tw]
+             else:
+                 mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
             
-        # Convert to Torch Tensors
-        # Image: (1, H, W)
-        data_tensor = torch.from_numpy(img).unsqueeze(0) 
         
-        # Label: One-Hot Encoding for num_classes
-        # mask is (H, W) with values 0..N
-        # We need (C, H, W)
-        mask = torch.from_numpy(mask).long()
-        label_tensor = torch.nn.functional.one_hot(mask, num_classes=self.num_classes).permute(2, 0, 1).float()
+        # 3. Format Output
+        # Return HWC numpy arrays for compatibility with BatchgeneratorsDataLoader -> NumpyToTensor
         
-        # Return dict as expected by MedNCAAgent
+        # Image: (H, W) -> (H, W, 1)
+        img = img[..., np.newaxis]
+        
+        # Label: One-Hot Encoding
+        # mask is (H, W). We want (H, W, C)
+        # Using torch for convenient one_hot, then back to numpy
+        mask_tensor = torch.from_numpy(mask).long()
+        label_onehot = torch.nn.functional.one_hot(mask_tensor, num_classes=self.num_classes).numpy().astype(np.float32)
+        
+        # Return dict
         return {
-            'image': data_tensor,
-            'label': label_tensor,
+            'image': img, 
+            'label': label_onehot,
             'id': f"{folder}_{frame_idx}",
             'folder': folder,
             'frame_index': frame_idx

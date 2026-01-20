@@ -247,3 +247,36 @@ class DiceFocalLoss_2(FocalLoss):
         focal = loss_bce * (1 - logit) ** self.gamma  # focal loss
         dice_focal = focal.mean() + dice_loss
         return dice_focal
+
+import einops
+
+class CrossEntropyLossWrapper(torch.nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.loss = torch.nn.CrossEntropyLoss(**kwargs)
+
+    def forward(self, logits=None, target=None, x=None, y=None, **kwargs):
+         if logits is None: logits = x
+         if target is None: target = y
+         
+         # Heuristic to detect BHWC vs BCHW
+         # Assume Channels C is much smaller than Spatial H, W.
+         # BHWC: last dim is C. BCHW: dim 1 is C.
+         
+         # Permute logits if BHWC
+         if logits.dim() == 4:
+             # Check if last dim is likely channels (e.g. < dim 1)
+             if logits.shape[-1] < logits.shape[1]: 
+                  logits = einops.rearrange(logits, 'b h w c -> b c h w')
+
+         # Handle one-hot target
+         if target.dtype == torch.float32 or target.dtype == torch.float16:
+              if target.dim() == 4:
+                   # Check if last dim is likely channels (BHWC)
+                   if target.shape[-1] < target.shape[1]:
+                       target = torch.argmax(target, dim=-1)
+                   else:
+                       # Assume BCHW
+                       target = torch.argmax(target, dim=1)
+                   
+         return self.loss(logits, target)

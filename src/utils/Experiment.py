@@ -52,7 +52,12 @@ class Experiment():
         self.storage = {}
         self.model_state = "train"
         self.general_preload()
-        if(os.path.isdir(os.path.join(pc.FILER_BASE_PATH, self.config['experiment.model_path'], 'models'))):
+        
+        model_path_base = os.path.join(pc.FILER_BASE_PATH, self.config['experiment.model_path'])
+        has_models = os.path.isdir(os.path.join(model_path_base, 'models'))
+        has_datasplit = os.path.isfile(os.path.join(model_path_base, 'data_split.pkl'))
+
+        if has_models and has_datasplit:
             self.reload()
         else:
             self.setup()
@@ -192,7 +197,7 @@ class Experiment():
             if in_key.lower() != 'y':
                 raise Exception(f"Loaded configuration is missing keys: {config_keys}. Check if you are loading the correct experiment.")
 
-        self.config = loaded_config
+        self.config = self.config | loaded_config
 
         self.set_model_state("train")
 

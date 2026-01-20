@@ -7,21 +7,26 @@ from src.utils.Study import Study
 from src.utils.ProjectConfiguration import ProjectConfiguration as pc
 import os, torch
 
-# Define dataset paths
-# Assuming standard paths based on user request history, but should double check or provide variables
-# History mentions: 
-# Data: /Users/khvastow/Work/TUM/m2nd semester/Comp Bio/data/OCTA_6mm/OCT
-# Labels: /Users/khvastow/Work/TUM/m2nd semester/Comp Bio/data/Label/GT_Layers
 
-DATA_ROOT = '/vol/data/BioProject13/data_OCT/OCT'
-LABEL_ROOT = '/vol/data/BioProject13/data_OCT/Label/GT_Layers'
+DATA_ROOT = "/vol/data/BioProject13/data_OCT/OCT"
+LABEL_ROOT = "/vol/data/BioProject13/data_OCT/Label/GT_Layers"
 
 study_config = {
-    'experiment.name': r'OctreeNCA_Video2D',
-    'experiment.description': "OctreeNCA 2D Training on Video Frames",
-    'model.output_channels': 3,
+    'experiment.name': r'OctreeNCA_Video2D_7Class',
+    'experiment.description': 'Training OctreeNCA on 2D video slices from OCTA dataset with 7 classes.',
+    'model.output_channels': 7,
+    'model.input_channels': 1,
     'experiment.use_wandb': True,
-    'experiment.wandb_project': 'OctreeNCA_Video'
+    'experiment.wandb_project': 'OctreeNCA_Video',
+    'experiment.dataset.img_path': DATA_ROOT,
+    'experiment.dataset.label_path': LABEL_ROOT,
+    'experiment.dataset.seed': 42,
+    'experiment.data_split': [0.7, 0.2, 0.1],
+    'experiment.dataset.input_size': (400, 400),
+    'experiment.dataset.transform_mode': 'crop', # Options: 'resize', 'crop'
+    'trainer.num_steps_per_epoch': 1000,
+    'trainer.batch_duplication': 1,
+    'trainer.n_epochs': 10
 }
 
 # Merge default configs
@@ -47,7 +52,8 @@ alpha = 1.0
 # For now, let's use a config that fits 400x400 or just try to run it.
 # Actually, the user's OctreeNCAV2 implementation seems to handle levels.
 # Let's set a resolution hierarchy.
-study_config['model.octree.res_and_steps'] = [[[320,320], steps], [[160,160], steps], [[80,80], steps], [[40,40], steps], [[20,20], int(alpha * 20)]]
+# Adjust resolutions for 400x400 input
+study_config['model.octree.res_and_steps'] = [[[400,400], steps], [[200,200], steps], [[100,100], steps], [[50,50], steps], [[25,25], int(alpha * 20)]]
 
 study_config['model.channel_n'] = 16
 study_config['model.hidden_size'] = 64
@@ -58,11 +64,12 @@ ema_decay = 0.99
 study_config['trainer.ema'] = ema_decay > 0.0
 study_config['trainer.ema.decay'] = ema_decay
 
-study_config['trainer.losses'] = ["src.losses.DiceLoss.DiceLoss", "src.losses.BCELoss.BCELoss"]
-study_config['trainer.losses.parameters'] = [{}, {}]
+study_config['trainer.losses'] = ["src.losses.DiceLoss.nnUNetSoftDiceLoss", "src.losses.LossFunctions.CrossEntropyLossWrapper"]
+study_config['trainer.losses.parameters'] = [{"apply_nonlin": None, "batch_dice": True, "do_bg": False, "smooth": 1e-05}, {}]
 study_config['trainer.loss_weights'] = [dice_loss_weight, 2.0-dice_loss_weight]
 
 study_config['model.normalization'] = "none"
+study_config['model.apply_nonlin'] = "torch.nn.Softmax(dim=1)"
 
 # Update experiment name with params
 study_config['experiment.name'] = f"Video2D_{study_config['model.normalization']}_{steps}_{alpha}_{study_config['model.channel_n']}"
@@ -75,7 +82,8 @@ study = Study(study_config)
 dataset_args = {
     'data_root': DATA_ROOT,
     'label_root': LABEL_ROOT,
-    'preload': False # Set to True if RAM allows
+    'preload': False, # Set to True if RAM allows
+    'num_classes': 7
 }
 
 # The EXP_OctreeNCA wrapper uses the dataset_class and dataset_args to instantiate the dataset
