@@ -114,7 +114,9 @@ class Video2DDataset(Dataset_Base):
         # Read as grayscale
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
-             raise RuntimeError(f"Failed to read image: {img_path}")
+             print(f"Warning: Failed to read image: {img_path}. Retrying with random sample.")
+             new_idx = np.random.randint(0, len(self))
+             return self.load_sample(new_idx)
              
         # Convert to float32 and normalize
         img = img.astype(np.float32) / 255.0

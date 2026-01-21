@@ -77,6 +77,9 @@ class BaseAgent():
             self.ema: EMA = EMA(self.model, self.exp.config['trainer.ema.decay'])
             assert self.exp.config['trainer.ema.update_per'] in ['batch', 'epoch']
 
+        if self.exp.config.get('trainer.use_amp', False):
+             self.scaler = torch.amp.GradScaler('cuda')
+
     def printIntermediateResults(self, loss: torch.Tensor, epoch: int) -> None:
         r"""Prints intermediate results of training and adds it to tensorboard
             #Args 
@@ -85,7 +88,7 @@ class BaseAgent():
         """
         print(epoch, "loss =", loss.item())
         self.exp.save_model()
-        self.exp.write_scalar('Loss/train', loss, epoch)
+
 
     def prepare_data(self, data: list, eval: bool = False) -> list:
         r"""If any data preparation needs to be done do it here. 
@@ -130,19 +133,32 @@ class BaseAgent():
         #print(outputs.shape, targets.shape)
         #2D: outputs: BHWC, targets: BHWC
         out["target_unpatched"] = data["label"]
-        loss, loss_ret = loss_f(**out)
+        if self.exp.config.get('trainer.use_amp', False):
+            # Using AMP
+            with torch.amp.autocast('cuda'):
+                loss, loss_ret = loss_f(**out)
+        else:
+            loss, loss_ret = loss_f(**out)
 
         do_backward = False
         if isinstance(loss, torch.Tensor):
             if loss.numel() > 1:
                 loss = loss.mean()
+            # If loss was 6 elements, .mean() reduces it to a scalar tensor (0-dim or 1-dim size 1)
+            # calling .item() should now work.
             if loss.item() != 0:
                 do_backward = True
         elif loss != 0:
             do_backward = True
 
         if do_backward:
-            loss.backward()
+            if self.exp.config.get('trainer.use_amp', False):
+                self.scaler.scale(loss).backward()
+                if self.exp.config['trainer.normalize_gradients'] == "all" or self.exp.config['experiment.logging.track_gradient_norm']:
+                     self.scaler.unscale_(self.optimizer)
+                     # ... unscaling happens
+            else:
+                loss.backward()
 
             if self.exp.config['trainer.normalize_gradients'] == "all" or self.exp.config['experiment.logging.track_gradient_norm']:
                 total_norm = 0
@@ -171,7 +187,11 @@ class BaseAgent():
                     self.epoch_grad_norm = []
                 self.epoch_grad_norm.append(total_norm)
 
-            self.optimizer.step()
+            if self.exp.config.get('trainer.use_amp', False):
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
             if not self.exp.config['trainer.update_lr_per_epoch']:
                 self.update_lr()
             
@@ -364,12 +384,25 @@ class BaseAgent():
         for epoch in range(self.exp.currentStep, self.exp.get_max_steps()+1):
             torch.cuda.reset_peak_memory_stats(self.device)
             print(f"{datetime.datetime.now().strftime('%I:%M%p, %B %d, %Y')} Epoch: {epoch}")
+            if epoch == self.exp.currentStep:
+                self.exp.watch_model(self.model) # Watch model at start of training
             self.exp.set_model_state('train')
             loss_log = {}
             self.initialize_epoch()
             print('Dataset size: ' + str(len(dataloader)))
             for i, data in enumerate(tqdm(dataloader)):
                 loss_item = self.batch_step(data, loss_f)
+                
+                # Step-wise logging
+                global_step = (epoch * len(dataloader)) + i
+                if i % 10 == 0:
+                     for key, value in loss_item.items():
+                         if isinstance(value, torch.Tensor):
+                             val = value.item()
+                         else:
+                             val = value
+                         self.exp.write_scalar(f'Loss/train_step/{key}', val, global_step)
+
                 for key in loss_item.keys():
                     if key not in loss_log:
                         loss_log[key] = []

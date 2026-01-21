@@ -516,6 +516,10 @@ class Experiment():
         if self.use_wandb:
             wandb.log({tag: wandb.Image(figure)}, step=step)
 
+    def watch_model(self, model):
+        if self.use_wandb:
+            wandb.watch(model, log="all", log_freq=100)
+
 
 class DataSplit():
     r"""Handles the splitting of data
