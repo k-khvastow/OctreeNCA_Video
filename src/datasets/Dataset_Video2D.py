@@ -7,8 +7,10 @@ import natsort
 import cv2
 from src.datasets.Dataset_Base import Dataset_Base
 
+import pickle
+
 class Video2DDataset(Dataset_Base):
-    def __init__(self, data_root, label_root, preload=False, num_classes=8, transform_mode='resize'):
+    def __init__(self, data_root, label_root, preload=False, num_classes=8, transform_mode='resize', input_size=None):
         super().__init__()
         """
         Args:
@@ -17,12 +19,17 @@ class Video2DDataset(Dataset_Base):
             preload (bool): If True, load all data into RAM.
             num_classes (int): Number of segmentation classes (output channels).
             transform_mode (str): 'resize' or 'crop'.
+            input_size (tuple/list): (Height, Width) target size using for resizing/cropping.
         """
         self.data_root = data_root
         self.label_root = label_root
         self.preload = preload
         self.num_classes = num_classes
         self.transform_mode = transform_mode
+        if input_size is not None:
+            # self.size expected as (H, W) or (D, H, W)?
+            # In load_sample: target_size = (self.size[1], self.size[0]) implies self.size is (H, W).
+            self.size = input_size
 
         # Attributes required by Agent_UNet / Agent_MedNCA
         self.slice = -1 
@@ -70,11 +77,38 @@ class Video2DDataset(Dataset_Base):
         # 2. Preload if requested
         self.cache = {}
         if self.preload:
-            print("Preloading data... (This may take a while and consume a lot of RAM)")
-            for i in range(len(self.samples)):
-                self.cache[i] = self.load_sample(i)
-                if i % 100 == 0:
-                    print(f"Loaded {i}/{len(self.samples)}")
+            # Caching Setup
+            cache_dir = os.path.join(data_root, "_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            size_str = f"{input_size[0]}x{input_size[1]}" if input_size else "ORIG"
+            cache_filename = f"preload_cache_c{num_classes}_{transform_mode}_{size_str}.pkl"
+            cache_path = os.path.join(cache_dir, cache_filename)
+
+            if os.path.exists(cache_path):
+                print(f"Loading preloaded data from cache: {cache_path}")
+                try:
+                    with open(cache_path, 'rb') as f:
+                        self.cache = pickle.load(f)
+                    print(f"Successfully loaded {len(self.cache)} samples from cache.")
+                except Exception as e:
+                    print(f"Failed to load cache: {e}. Reloading from scratch.")
+                    self.cache = {} # Reset to force reload
+            
+            if not self.cache:
+                print("Preloading data... (This may take a while and consume a lot of RAM)")
+                for i in range(len(self.samples)):
+                    self.cache[i] = self.load_sample(i)
+                    if i % 100 == 0:
+                        print(f"Loaded {i}/{len(self.samples)}")
+                
+                # Save to cache
+                print(f"Saving preloaded data to cache: {cache_path}")
+                try:
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(self.cache, f)
+                except Exception as e:
+                    print(f"Warning: Failed to save cache: {e}")
 
     def getFilesInPath(self, path: str):
         """
@@ -207,6 +241,7 @@ class Video2DDataset(Dataset_Base):
             'image': img, 
             'label': label_onehot,
             'id': f"{folder}_{frame_idx}",
+            'patient_id': meta['id'], # Added for Agent compatibility
             'folder': folder,
             'frame_index': frame_idx
         }

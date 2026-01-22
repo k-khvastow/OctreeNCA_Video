@@ -1,5 +1,5 @@
 default_config ={
-    'experiment.data_split': [0.7, 0, 0.3],
+    #'experiment.data_split': [0.7, 0, 0.3],
     'experiment.save_interval': 50,
     'experiment.device': "cuda:0",
 

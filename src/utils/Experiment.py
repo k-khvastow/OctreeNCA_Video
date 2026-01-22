@@ -501,20 +501,33 @@ class Experiment():
     def write_histogram(self, tag: str, data: dict, step: int) -> None:
         r"""Write data as histogram to tensorboard
         """
+        if self.use_wandb:
+            wandb.log({tag: wandb.Histogram(data)}, step=step)
+
         data = Distribution(data)
         self.run.track(step=step, value=data, name=tag)
         #self.writer.add_histogram(tag, data, step)
-        if self.use_wandb:
-            wandb.log({tag: wandb.Histogram(np_histogram=data)}, step=step)
+
+    def fig2img(self, fig):
+        r"""Convert a Matplotlib figure to a PIL Image and return it"""
+        import io
+        buf = io.BytesIO()
+        fig.savefig(buf)
+        buf.seek(0)
+        img = PILImage.open(buf)
+        return img
 
     def write_figure(self, tag: str, figure: figure, step: int) -> None:
         r"""Write a figure to tensorboard images
         """
+        if self.use_wandb:
+            img = self.fig2img(figure)
+            wandb.log({tag: wandb.Image(img)}, step=step)
+
         figure = Figure(figure)
         self.run.track(step=step, value=figure, name=tag)
         #self.writer.add_figure(tag, figure, step)
-        if self.use_wandb:
-            wandb.log({tag: wandb.Image(figure)}, step=step)
+
 
     def watch_model(self, model):
         if self.use_wandb:
