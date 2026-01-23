@@ -25,7 +25,7 @@ def get_study_config():
         'experiment.dataset.img_path': DATA_ROOT,
         'experiment.dataset.label_path': LABEL_ROOT,
         'experiment.dataset.seed': 42,
-        'experiment.data_split': [0.7, 0.2, 0.1],
+        'experiment.data_split': [0.7, 0.29, 0.01],
         'experiment.dataset.input_size': (400, 400),
         'experiment.dataset.transform_mode': 'resize', # Options: 'resize', 'crop'
         'trainer.num_steps_per_epoch': 1000,

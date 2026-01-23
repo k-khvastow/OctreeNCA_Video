@@ -159,5 +159,8 @@ class nnUNetSoftDiceLoss(torch.nn.Module):
             else:
                 for _class in range(dc.shape[1]):
                     loss_ret[f"mask_{_class}"] = 1 - dc[:, _class].mean().item()
+            
+            # Log the overall dice loss (Mean of per-class dice losses)
+            loss_ret["overall"] = 1 - dc.mean().item()
 
         return -dc, loss_ret
