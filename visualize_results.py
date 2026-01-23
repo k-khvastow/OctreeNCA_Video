@@ -15,7 +15,7 @@ def visualize(num_samples=3):
     # 1. Setup
     study_config = get_study_config()
     study_config['experiment.dataset.preload'] = False 
-    random_word = "stepdaughter"  # Fixed word for visualization naming
+    random_word = "subsidence"  # Fixed word for visualization naming
     
     # Get dataset args
     dataset_args = get_dataset_args(study_config)
