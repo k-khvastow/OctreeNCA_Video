@@ -27,7 +27,7 @@ def get_study_config():
         'experiment.dataset.seed': 42,
         'experiment.data_split': [0.7, 0.29, 0.01],
         'experiment.dataset.input_size': (400, 400),
-        'experiment.dataset.transform_mode': 'resize', # Options: 'resize', 'crop'
+        'experiment.dataset.transform_mode': 'crop', # Options: 'resize', 'crop'
         'trainer.num_steps_per_epoch': 1000,
         'trainer.batch_duplication': 1,
         'trainer.n_epochs': 10
@@ -42,7 +42,7 @@ def get_study_config():
     # Experiment settings
     study_config['experiment.logging.also_eval_on_train'] = False
     study_config['experiment.save_interval'] = 3
-    study_config['experiment.logging.evaluate_interval'] = 3
+    study_config['experiment.logging.evaluate_interval'] = 40
     study_config['experiment.task.score'] = ["src.scores.PatchwiseDiceScore.PatchwiseDiceScore",
                                              "src.scores.PatchwiseIoUScore.PatchwiseIoUScore"]
 
@@ -88,7 +88,7 @@ def get_dataset_args(study_config):
         'data_root': DATA_ROOT,
         'label_root': LABEL_ROOT,
         'preload': False, # Set to True if RAM allows
-        'num_classes': 7,
+        'num_classes': study_config['model.output_channels'],
         'transform_mode': study_config['experiment.dataset.transform_mode'],
         'input_size': study_config['experiment.dataset.input_size']
     }

@@ -144,8 +144,7 @@ class Video2DDataset(Dataset_Base):
         img_path = os.path.join(data_dir, img_name)
         label_path = os.path.join(self.label_root, f"{folder}.mat")
         
-        # 1. Load Image
-        # Read as grayscale
+        # 1. Load Image (Original)
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
              print(f"Warning: Failed to read image: {img_path}. Retrying with random sample.")
@@ -154,94 +153,73 @@ class Video2DDataset(Dataset_Base):
              
         # Convert to float32 and normalize
         img = img.astype(np.float32) / 255.0
-
-        if hasattr(self, 'size') and self.size is not None:
-             target_size = (self.size[1], self.size[0]) # size is (H, W) -> (W, H)
-             
-             if self.transform_mode == 'crop':
-                 # Center crop
-                 h, w = img.shape
-                 th, tw = self.size[0], self.size[1]
-                 x1 = int(round((w - tw) / 2.))
-                 y1 = int(round((h - th) / 2.))
-                 # Handle cases where image is smaller than target
-                 if x1 < 0 or y1 < 0:
-                      # Fallback to resize or pad? User asked for crop from middle.
-                      # Ideally pad. For now, let's just resize if too small, or let array slicing handle it (risky)
-                      # Safest simple approach: Resize if smaller, Crop if larger
-                      if w < tw or h < th:
-                          img = cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR)
-                      else:
-                          img = img[y1:y1+th, x1:x1+tw]
-                 else:
-                     img = img[y1:y1+th, x1:x1+tw]
-             else:
-                 # Resize
-                 img = cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR)
-
-        depth, width = img.shape
         
-        # 2. Generate Segmentation Mask
+        # Capture ORIGINAL dimensions
+        orig_h, orig_w = img.shape
+        
+        # 2. Generate Mask (at Original Resolution)
         # We need the layers data. 
-        # Caching optimization: if we just loaded this file for the previous frame, reuse it.
         layers_data = self._get_mat_data(label_path)
         
-        # layers_data shape: (num_layers, num_frames, width)
         # Check standard consistency
         num_layers = layers_data.shape[0]
         total_frames = layers_data.shape[1]
         
         if frame_idx >= total_frames:
-            # Fallback or error?
-            # If the image list has more frames than the label file, we cannot generate a mask.
             raise RuntimeError(f"Frame index {frame_idx} out of bounds for label {label_path} with {total_frames} frames.")
             
-        mask = np.zeros((depth, width), dtype=np.float32)
-        y_grid = np.arange(depth).reshape(depth, 1) # (H, 1)
+        # Initialize mask with ORIGINAL dimensions
+        mask = np.zeros((orig_h, orig_w), dtype=np.float32)
+        y_grid = np.arange(orig_h).reshape(orig_h, 1) # (H_orig, 1)
         
         for i in range(num_layers):
-            layer_surface = layers_data[i, frame_idx, :] # (width,)
-            layer_surface_expanded = layer_surface.reshape(1, width) # (1, W)
-            layer_surface_expanded = layer_surface.reshape(1, width) # (1, W)
+            layer_surface = layers_data[i, frame_idx, :] # (orig_w,)
+            layer_surface_expanded = layer_surface.reshape(1, orig_w)
+            # Compare original y_grid with original layer coordinates
             mask += (y_grid > layer_surface_expanded).astype(np.float32)
 
-        # Resize Mask if self.size is set
+        # 3. Apply Transformations to BOTH Image and Mask
         if hasattr(self, 'size') and self.size is not None:
-             target_size = (self.size[1], self.size[0])
+             target_size = (self.size[1], self.size[0]) # size is (H, W) -> (W, H)
              
              if self.transform_mode == 'crop':
-                 # Re-calculate crop coordinates for mask (reuse logic or recompute)
-                 h, w = mask.shape
+                 # Center crop based on original dimensions
+                 h, w = orig_h, orig_w
                  th, tw = self.size[0], self.size[1]
                  x1 = int(round((w - tw) / 2.))
                  y1 = int(round((h - th) / 2.))
                  
-                 if w < tw or h < th:
-                      mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
-                 else:
-                      mask = mask[y1:y1+th, x1:x1+tw]
+                 # Define helper to handle cases where image is smaller than target
+                 def smart_crop(arr, interp):
+                     if w < tw or h < th:
+                          return cv2.resize(arr, target_size, interpolation=interp)
+                     else:
+                          # Ensure bounds
+                          x_start = max(0, x1)
+                          y_start = max(0, y1)
+                          return arr[y_start:y_start+th, x_start:x_start+tw]
+
+                 img = smart_crop(img, cv2.INTER_LINEAR)
+                 mask = smart_crop(mask, cv2.INTER_NEAREST)
+                 
              else:
+                 # Resize both
+                 img = cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR)
                  mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
             
-        
-        # 3. Format Output
-        # Return HWC numpy arrays for compatibility with BatchgeneratorsDataLoader -> NumpyToTensor
-        
+        # 4. Format Output
         # Image: (H, W) -> (H, W, 1)
         img = img[..., np.newaxis]
         
         # Label: One-Hot Encoding
-        # mask is (H, W). We want (H, W, C)
-        # Using torch for convenient one_hot, then back to numpy
         mask_tensor = torch.from_numpy(mask).long()
         label_onehot = torch.nn.functional.one_hot(mask_tensor, num_classes=self.num_classes).numpy().astype(np.float32)
         
-        # Return dict
         return {
             'image': img, 
             'label': label_onehot,
             'id': f"{folder}_{frame_idx}",
-            'patient_id': meta['id'], # Added for Agent compatibility
+            'patient_id': meta['id'],
             'folder': folder,
             'frame_index': frame_idx
         }

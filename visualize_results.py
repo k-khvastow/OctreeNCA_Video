@@ -15,7 +15,7 @@ def visualize(num_samples=3):
     # 1. Setup
     study_config = get_study_config()
     study_config['experiment.dataset.preload'] = False 
-    random_word = "airline"  # Fixed word for visualization naming
+    random_word = "stepdaughter"  # Fixed word for visualization naming
     
     # Get dataset args
     dataset_args = get_dataset_args(study_config)
@@ -157,7 +157,7 @@ def visualize(num_samples=3):
             ax_right.set_title(f"Sample {idx}: Prediction")
             ax_right.axis('off')
 
-    out_path = "visualisationOCT/visualization_results.png"
+    out_path = f"visualisationOCT/{random_word}_visualization_results.png"
     plt.tight_layout()
     plt.savefig(out_path)
     print(f"Visualization saved to {os.path.abspath(out_path)}")
