@@ -10,10 +10,11 @@ class OctreeNCA2DWarmStart(OctreeNCA2DPatch2):
         self.warm_start_steps = config.get('model.octree.warm_start_steps', self.inference_steps[0])
 
     def forward(self, x: torch.Tensor, y: torch.Tensor = None, prev_state: torch.Tensor = None, batch_duplication=1):
-        # x: BCHW (Current Frame Image)
+        # x: BCHW (Current Frame Image) - The dataset returns BCHW
         # y: BCHW (Current Frame Label)
         # prev_state: BHWC (State from previous frame at finest resolution)
 
+        # Standardize inputs to BHWC for processing
         x = x.permute(0, 2, 3, 1) # -> BHWC
         if y is not None:
             y = y.permute(0, 2, 3, 1) # -> BHWC
@@ -33,11 +34,10 @@ class OctreeNCA2DWarmStart(OctreeNCA2DPatch2):
         
         # Branch A: Cold Start (Standard Coarse-to-Fine)
         if prev_state is None:
-            # Assume input x is at target resolution (finest)
-            # We assume the dataset provides correct resolution, bypassing the complex patching logic of the parent
+            # We assume input x matches the finest resolution
+            # Prepare inputs for all levels (for injection) using PyTorch interpolate (requires BCHW)
             x_bchw = x.permute(0, 3, 1, 2)
             
-            # Prepare inputs for all levels (for injection)
             inputs_at_levels = {} 
             for level in range(len(self.octree_res)):
                 if level == 0:
@@ -45,51 +45,57 @@ class OctreeNCA2DWarmStart(OctreeNCA2DPatch2):
                 else:
                     target_res = self.octree_res[level]
                     down = torch.nn.functional.interpolate(x_bchw, size=target_res, mode='bilinear', align_corners=False)
-                    inputs_at_levels[level] = down.permute(0, 2, 3, 1)
+                    inputs_at_levels[level] = down.permute(0, 2, 3, 1) # Store as BHWC
 
             # Start from Coarsest Level
             coarsest_lvl = len(self.octree_res) - 1
+            # Initialize state: Zeros + Input Image
+            # State shape: (B, H, W, C)
             state = torch.zeros(x.shape[0], *self.octree_res[coarsest_lvl], self.channel_n, device=self.device)
             state[..., :self.input_channels] = inputs_at_levels[coarsest_lvl][..., :self.input_channels]
 
-            # Upscaling Loop
+            # Loop from Coarsest to Finest
             for level in range(len(self.octree_res)-1, -1, -1):
                 steps = self.inference_steps[level]
-                state = state.permute(0, 3, 1, 2)
                 
+                # FIX: Do NOT permute to BCHW here. 
+                # The backbone (BasicNCA2DFast) expects BHWC and handles rearrangement internally.
                 if self.separate_models:
                     state = self.backbone_ncas[level](state, steps=steps, fire_rate=self.fire_rate)
                 else:
                     state = self.backbone_nca(state, steps=steps, fire_rate=self.fire_rate)
                 
+                # Upscale if not at finest level
                 if level > 0:
-                    # Upscale
+                    # Upsampling requires BCHW
+                    state = state.permute(0, 3, 1, 2) # BHWC -> BCHW
                     state = torch.nn.Upsample(scale_factor=tuple(self.computed_upsampling_scales[level-1][0]), mode='nearest')(state)
-                    state = state.permute(0, 2, 3, 1)
-                    # Inject Image
+                    state = state.permute(0, 2, 3, 1) # BCHW -> BHWC
+                    
+                    # Inject details from input image at this new resolution
                     target_input = inputs_at_levels[level-1]
                     state[..., :self.input_channels] = target_input[..., :self.input_channels]
-                else:
-                    state = state.permute(0, 2, 3, 1)
 
         # Branch B: Warm Start
         else:
-            # 1. Inject: Overwrite input channels of previous state with NEW image
+            # prev_state is from t-1 at finest resolution (BHWC).
+            
+            # 1. Inject: Overwrite the input channels of the previous state with the NEW image
             state = prev_state.clone()
             state[..., :self.input_channels] = x[..., :self.input_channels]
             
-            # 2. Run NCA at finest level (Level 0) only
+            # 2. Run NCA at finest level (Level 0)
             steps = self.warm_start_steps
-            state = state.permute(0, 3, 1, 2)
             
+            # FIX: Pass BHWC directly to backbone
             if self.separate_models:
                 state = self.backbone_ncas[0](state, steps=steps, fire_rate=self.fire_rate)
             else:
                 state = self.backbone_nca(state, steps=steps, fire_rate=self.fire_rate)
                 
-            state = state.permute(0, 2, 3, 1)
+            # State remains BHWC
 
-        # Output
+        # Finalize Output
         logits = state[..., self.input_channels:self.input_channels+self.output_channels]
         hidden = state[..., self.input_channels+self.output_channels:]
         
@@ -102,6 +108,7 @@ class OctreeNCA2DWarmStart(OctreeNCA2DPatch2):
 
     @torch.no_grad()
     def forward_eval_warm(self, x: torch.Tensor, prev_state: torch.Tensor = None):
+        # Evaluation wrapper
         out = self.forward_train(x, x, prev_state=prev_state)
         out.pop('target')
         return out

@@ -13,9 +13,10 @@ class Video2DSequentialDataset(Dataset_Base):
         self.label_root = label_root
         self.sequence_length = sequence_length
         self.num_classes = num_classes
-        self.size = input_size # (H, W)
+        self.size = input_size 
 
-        self.sequences = [] # List of {'folder': str, 'start_frame': int}
+        self.sequences = [] 
+        self.sequences_dict = {}
 
         if not os.path.exists(data_root):
             raise ValueError(f"Data root not found: {data_root}")
@@ -31,13 +32,25 @@ class Video2DSequentialDataset(Dataset_Base):
                 
                 if num_frames >= sequence_length:
                     for i in range(0, num_frames - sequence_length + 1):
-                        self.sequences.append({
+                        seq_id = f"{item}_{i}"
+                        seq_data = {
                             'folder': item,
                             'start_frame': i,
-                            'image_names': img_list[i : i+sequence_length]
-                        })
+                            'image_names': img_list[i : i+sequence_length],
+                            'id': seq_id
+                        }
+                        self.sequences.append(seq_data)
+                        self.sequences_dict[seq_id] = seq_data
         
         print(f"Found {len(self.sequences)} valid sequences of length {sequence_length}.")
+
+    def getFilesInPath(self, path: str):
+        return {k: {'id': k} for k in self.sequences_dict.keys()}
+
+    def setPaths(self, images_path: str, images_list: list, labels_path: str, labels_list: list) -> None:
+        super().setPaths(images_path, images_list, labels_path, labels_list)
+        self.sequences = [self.sequences_dict[uid] for uid in self.images_list if uid in self.sequences_dict]
+        print(f"Dataset split set. Active samples: {len(self.sequences)}")
 
     def __len__(self):
         return len(self.sequences)
@@ -60,7 +73,7 @@ class Video2DSequentialDataset(Dataset_Base):
         orig_h, orig_w = first_img.shape
         
         th, tw = self.size
-        # Fallback to resize if smaller, otherwise crop
+        
         if orig_w >= tw and orig_h >= th:
             crop_x = (orig_w - tw) // 2
             crop_y = (orig_h - th) // 2
@@ -86,15 +99,20 @@ class Video2DSequentialDataset(Dataset_Base):
             imgs.append(img[np.newaxis, ...]) # (1, H, W)
             masks.append(mask)
 
-        imgs_tensor = torch.from_numpy(np.stack(imgs)).float() # (T, 1, H, W)
+        # Stack to Numpy Arrays (T, C, H, W)
+        imgs_np = np.stack(imgs) # (T, 1, H, W)
         masks_np = np.stack(masks) # (T, H, W)
+        
+        # Process Labels: One-Hot Encoding
+        # We use torch for convenient one_hot, then convert back to numpy
         masks_tensor = torch.from_numpy(masks_np).long()
         masks_onehot = torch.nn.functional.one_hot(masks_tensor, num_classes=self.num_classes)
-        masks_onehot = masks_onehot.permute(0, 3, 1, 2).float() # (T, C, H, W)
+        masks_onehot = masks_onehot.permute(0, 3, 1, 2).float().numpy() # (T, C, H, W)
 
+        # Return standard keys 'image' and 'label'
         return {
-            'image_sequence': imgs_tensor, 
-            'label_sequence': masks_onehot,
+            'image': imgs_np, 
+            'label': masks_onehot,
             'id': f"{folder}_{start_frame}"
         }
 

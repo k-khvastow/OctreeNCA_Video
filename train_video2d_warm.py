@@ -42,7 +42,8 @@ def get_study_config():
     # Model Specifics
     # Resolution must match input_size for the top level
     steps = 10
-    study_config['model.octree.res_and_steps'] = [[[400,400], steps], [[200,200], steps], [[100,100], steps], [[50,50], steps]]
+    alpha = 1.0
+    study_config['model.octree.res_and_steps'] = [[[400,400], steps], [[200,200], steps], [[100,100], steps], [[50,50], steps], [[25,25], int(alpha * 20)]]
     study_config['model.octree.warm_start_steps'] = 5  # Reduced steps for warm start
     study_config['model.channel_n'] = 24
     study_config['model.hidden_size'] = 32
