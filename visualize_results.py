@@ -157,7 +157,7 @@ def visualize(num_samples=3):
             ax_right.set_title(f"Sample {idx}: Prediction")
             ax_right.axis('off')
 
-    out_path = "visualization_results.png"
+    out_path = "visualisationOCT/visualization_results.png"
     plt.tight_layout()
     plt.savefig(out_path)
     print(f"Visualization saved to {os.path.abspath(out_path)}")
