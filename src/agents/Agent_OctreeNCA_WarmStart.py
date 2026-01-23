@@ -54,24 +54,64 @@ class OctreeNCAWarmStartAgent(MedNCAAgent):
         loss_val = loss_val / T
         loss_ret = {k: v / T for k, v in loss_ret.items()}
         
+        # Ensure loss is scalar before backward
         if isinstance(loss_val, torch.Tensor) and loss_val.numel() > 1:
             loss_val = loss_val.mean()
+
+        # --- FIX: Gradient Norm Tracking Logic ---
+        track_grads = self.exp.config.get('experiment.logging.track_gradient_norm', False)
+        normalize_grads = self.exp.config['trainer.normalize_gradients'] == "all"
+        total_norm = 0.0
 
         # Backpropagation
         if self.exp.config.get('trainer.use_amp', False):
             self.scaler.scale(loss_val).backward()
             
-            if self.exp.config['trainer.normalize_gradients'] == "all":
+            # We must unscale before calculating norms or clipping
+            if normalize_grads or track_grads:
                  self.scaler.unscale_(self.optimizer)
-                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            
+            # Calculate Norm if needed
+            if normalize_grads or track_grads:
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.detach().data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+            
+            # Clip Gradients
+            if normalize_grads:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+            # Store Norm for Logging
+            if track_grads:
+                if not hasattr(self, 'epoch_grad_norm'):
+                    self.epoch_grad_norm = []
+                self.epoch_grad_norm.append(total_norm)
             
             self.scaler.step(self.optimizer)
             self.scaler.update()
+
         else:
             loss_val.backward()
             
-            if self.exp.config['trainer.normalize_gradients'] == "all":
+            # Calculate Norm if needed
+            if normalize_grads or track_grads:
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.detach().data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+
+            # Clip Gradients
+            if normalize_grads:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            
+            # Store Norm for Logging
+            if track_grads:
+                if not hasattr(self, 'epoch_grad_norm'):
+                    self.epoch_grad_norm = []
+                self.epoch_grad_norm.append(total_norm)
                 
             self.optimizer.step()
             

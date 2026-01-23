@@ -23,7 +23,7 @@ def get_study_config():
         'experiment.dataset.seed': 42,
         'experiment.data_split': [0.9, 0.09, 0.01],
         'experiment.dataset.input_size': (400, 400),
-        'trainer.num_steps_per_epoch': 1000,
+        'trainer.num_steps_per_epoch': 10,
         'trainer.batch_duplication': 1,
         'trainer.n_epochs': 20
     }

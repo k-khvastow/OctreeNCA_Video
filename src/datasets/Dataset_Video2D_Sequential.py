@@ -49,6 +49,7 @@ class Video2DSequentialDataset(Dataset_Base):
 
     def setPaths(self, images_path: str, images_list: list, labels_path: str, labels_list: list) -> None:
         super().setPaths(images_path, images_list, labels_path, labels_list)
+        # Filter sequences to only those in the split
         self.sequences = [self.sequences_dict[uid] for uid in self.images_list if uid in self.sequences_dict]
         print(f"Dataset split set. Active samples: {len(self.sequences)}")
 
@@ -56,60 +57,91 @@ class Video2DSequentialDataset(Dataset_Base):
         return len(self.sequences)
 
     def __getitem__(self, index):
-        meta = self.sequences[index]
-        folder = meta['folder']
-        start_frame = meta['start_frame']
-        img_names = meta['image_names']
-        
+        # 1. Recursive Skip Logic for Metadata/Folder
+        try:
+            meta = self.sequences[index]
+            folder = meta['folder']
+            start_frame = meta['start_frame']
+            img_names = meta['image_names']
+            
+            # Check folder existence
+            if not os.path.exists(os.path.join(self.data_root, folder)):
+                raise FileNotFoundError
+        except Exception:
+            # Skip to next
+            return self.__getitem__((index + 1) % len(self.sequences))
+
         label_path = os.path.join(self.label_root, f"{folder}.mat")
-        layers_data = self._load_mat_data(label_path) 
+        try:
+            layers_data = self._load_mat_data(label_path)
+        except Exception as e:
+            print(f"Error loading labels for {folder}: {e}. Skipping.")
+            return self.__getitem__((index + 1) % len(self.sequences))
 
         imgs = []
         masks = []
         
-        # Determine strict Center Crop
+        # 2. Determine Crop/Resize Parameters based on the first image
+        # (Assuming first image is representative; if corrupt, loop handles it)
+        mode = 'resize'
+        crop_x, crop_y = 0, 0
+        
+        # We need the dimensions. Try reading the first image.
         first_img_path = os.path.join(self.data_root, folder, img_names[0])
-        first_img = cv2.imread(first_img_path, cv2.IMREAD_GRAYSCALE)
-        orig_h, orig_w = first_img.shape
+        probe_img = cv2.imread(first_img_path, cv2.IMREAD_GRAYSCALE)
         
-        th, tw = self.size
-        
-        if orig_w >= tw and orig_h >= th:
-            crop_x = (orig_w - tw) // 2
-            crop_y = (orig_h - th) // 2
-            mode = 'crop'
+        if probe_img is not None:
+            orig_h, orig_w = probe_img.shape
+            th, tw = self.size
+            if orig_w >= tw and orig_h >= th:
+                crop_x = (orig_w - tw) // 2
+                crop_y = (orig_h - th) // 2
+                mode = 'crop'
+            else:
+                mode = 'resize'
         else:
-            mode = 'resize'
-            crop_x, crop_y = 0, 0
+            # If first image is dead, skip sequence
+            print(f"First image corrupt: {first_img_path}. Skipping sequence.")
+            return self.__getitem__((index + 1) % len(self.sequences))
 
+        # 3. Load Sequence
         for i, img_name in enumerate(img_names):
             img_path = os.path.join(self.data_root, folder, img_name)
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             
+            # --- Safety Check: Skip Entire Sequence if any frame is bad ---
+            if img is None:
+                print(f"Warning: Corrupt image {img_name} in {folder}. Skipping sequence.")
+                return self.__getitem__((index + 1) % len(self.sequences))
+            
+            # Convert to Float32 and Normalize immediately
+            img_processed = img.astype(np.float32) / 255.0
+            
+            # Load Mask
             abs_frame_idx = start_frame + i
             mask = self._generate_mask(layers_data, abs_frame_idx, orig_h, orig_w)
             
+            # Apply Transforms
             if mode == 'crop':
-                img = img[crop_y:crop_y+th, crop_x:crop_x+tw]
+                img_processed = img_processed[crop_y:crop_y+th, crop_x:crop_x+tw]
                 mask = mask[crop_y:crop_y+th, crop_x:crop_x+tw]
             else:
-                img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
+                img_processed = cv2.resize(img_processed, (tw, th), interpolation=cv2.INTER_LINEAR)
                 mask = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
             
-            imgs.append(img[np.newaxis, ...]) # (1, H, W)
+            imgs.append(img_processed[np.newaxis, ...]) # (1, H, W)
             masks.append(mask)
 
-        # Stack to Numpy Arrays (T, C, H, W)
+        # 4. Stack and Finalize
         imgs_np = np.stack(imgs) # (T, 1, H, W)
         masks_np = np.stack(masks) # (T, H, W)
         
-        # Process Labels: One-Hot Encoding
-        # We use torch for convenient one_hot, then convert back to numpy
+        imgs_np = imgs_np.astype(np.float32)
+        
         masks_tensor = torch.from_numpy(masks_np).long()
         masks_onehot = torch.nn.functional.one_hot(masks_tensor, num_classes=self.num_classes)
         masks_onehot = masks_onehot.permute(0, 3, 1, 2).float().numpy() # (T, C, H, W)
 
-        # Return standard keys 'image' and 'label'
         return {
             'image': imgs_np, 
             'label': masks_onehot,
