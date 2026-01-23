@@ -21,7 +21,7 @@ def get_study_config():
         'experiment.dataset.img_path': DATA_ROOT,
         'experiment.dataset.label_path': LABEL_ROOT,
         'experiment.dataset.seed': 42,
-        'experiment.data_split': [0.9, 0.09, 0.01],
+        'experiment.data_split': [0.9, 0.0999, 0.001],
         'experiment.dataset.input_size': (400, 400),
         'trainer.num_steps_per_epoch': 10,
         'trainer.batch_duplication': 1,
@@ -37,7 +37,7 @@ def get_study_config():
     # Experiment settings
     study_config['experiment.logging.also_eval_on_train'] = False
     study_config['experiment.save_interval'] = 3
-    study_config['experiment.logging.evaluate_interval'] = 40
+    study_config['experiment.logging.evaluate_interval'] = 1
     
     # Model Specifics
     # Resolution must match input_size for the top level
