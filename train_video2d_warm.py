@@ -21,9 +21,9 @@ def get_study_config():
         'experiment.dataset.img_path': DATA_ROOT,
         'experiment.dataset.label_path': LABEL_ROOT,
         'experiment.dataset.seed': 42,
-        'experiment.data_split': [0.9, 0.0999, 0.001],
+        'experiment.data_split': [0.998, 0.001, 0.001],
         'experiment.dataset.input_size': (400, 400),
-        'trainer.num_steps_per_epoch': 10,
+        'trainer.num_steps_per_epoch': 1000,
         'trainer.batch_duplication': 1,
         'trainer.n_epochs': 20
     }
@@ -36,8 +36,8 @@ def get_study_config():
 
     # Experiment settings
     study_config['experiment.logging.also_eval_on_train'] = False
-    study_config['experiment.save_interval'] = 3
-    study_config['experiment.logging.evaluate_interval'] = 1
+    study_config['experiment.save_interval'] = 5
+    study_config['experiment.logging.evaluate_interval'] = 100
     
     # Model Specifics
     # Resolution must match input_size for the top level
@@ -47,7 +47,7 @@ def get_study_config():
     study_config['model.octree.warm_start_steps'] = 5  # Reduced steps for warm start
     study_config['model.channel_n'] = 24
     study_config['model.hidden_size'] = 32
-    study_config['trainer.batch_size'] = 4  # Sequence batch size
+    study_config['trainer.batch_size'] = 1  # Sequence batch size
 
     dice_loss_weight = 1.0
     ema_decay = 0.99
@@ -70,7 +70,7 @@ def get_dataset_args(study_config):
     return {
         'data_root': DATA_ROOT,
         'label_root': LABEL_ROOT,
-        'sequence_length': 5, # Temporal sequence length
+        'sequence_length': 30, # Temporal sequence length
         'num_classes': study_config['model.output_channels'],
         'input_size': study_config['experiment.dataset.input_size']
     }

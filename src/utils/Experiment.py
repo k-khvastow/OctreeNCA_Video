@@ -318,6 +318,15 @@ class Experiment():
                                                                      batch_size=self.config['trainer.batch_size'],
                                                         num_workers=self.config['performance.num_workers'])
         
+        for split in ['val', 'test']:
+            if split in self.datasets:
+                self.data_loaders[split] = torch.utils.data.DataLoader(
+                    self.datasets[split],
+                    shuffle=False,
+                    batch_size=self.config['trainer.batch_size'],
+                    num_workers=self.config['performance.num_workers']
+                )
+                
         self.set_size()
 
 

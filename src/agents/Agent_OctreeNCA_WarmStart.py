@@ -132,14 +132,21 @@ class OctreeNCAWarmStartAgent(MedNCAAgent):
                 x_t = x_seq[:, t]
                 y_t = y_seq[:, t]
                 
+                # Model ignores y_t in eval, but returns probabilities in 'out'
                 out = self.model(x_t, y_t, prev_state=prev_state)
                 prev_state = out['final_state']
                 
-                # Permute to BCHW for Metrics
-                eval_out = out.copy()
-                if 'logits' in out: eval_out['logits'] = out['logits'].permute(0, 3, 1, 2)
-                if 'target' in out: eval_out['target'] = out['target'].permute(0, 3, 1, 2)
-                if 'probabilities' in out: eval_out['probabilities'] = out['probabilities'].permute(0, 3, 1, 2)
+                # Prepare input specifically for ScoreList (expects 'pred' and 'target')
+                eval_out = {}
+                
+                # 1. Map 'probabilities' or 'logits' to 'pred' and permute BHWC -> BCHW
+                if 'probabilities' in out: 
+                    eval_out['pred'] = out['probabilities'].permute(0, 3, 1, 2)
+                elif 'logits' in out:
+                    eval_out['pred'] = out['logits'].permute(0, 3, 1, 2)
+                
+                # 2. Explicitly provide the target (y_t is already BCHW from the loader)
+                eval_out['target'] = y_t
                 
                 # Calculate scores
                 scores = loss_f(**eval_out) 
