@@ -8,7 +8,15 @@ class OctreeNCAWarmStartAgent(MedNCAAgent):
     Agent for training OctreeNCA with temporal warm-start on video sequences.
     Expects data input to be (B, T, C, H, W).
     """
+    def __init__(self, model):
+        super().__init__(model)
+        self.accum_iter = 0
+
+
     def batch_step(self, data: dict, loss_f: torch.nn.Module) -> dict:
+        # Get accumulation steps from config (default to 1 if not set)
+        accum_steps = int(self.exp.config.get('trainer.gradient_accumulation', 1))
+
         # Standard keys from Experiment: 'image' and 'label'
         x_seq = data['image'].to(self.device)
         y_seq = data['label'].to(self.device)
@@ -24,7 +32,10 @@ class OctreeNCAWarmStartAgent(MedNCAAgent):
         loss_ret = {}
         prev_state = None
         
-        self.optimizer.zero_grad()
+        # --- MODIFIED: ONLY ZERO GRAD AT START OF ACCUMULATION CYCLE ---
+        if self.accum_iter % accum_steps == 0:
+            self.optimizer.zero_grad()
+        # -------------------------------------------------------------
         
         # Temporal Training Loop
         for t in range(T):
@@ -60,6 +71,10 @@ class OctreeNCAWarmStartAgent(MedNCAAgent):
         if isinstance(loss_val, torch.Tensor) and loss_val.numel() > 1:
             loss_val = loss_val.mean()
 
+        # --- MODIFIED: SCALE LOSS FOR ACCUMULATION ---
+        loss_val = loss_val / accum_steps
+        # ---------------------------------------------
+
         # Gradient Handling
         track_grads = self.exp.config.get('experiment.logging.track_gradient_norm', False)
         normalize_grads = self.exp.config['trainer.normalize_gradients'] == "all"
@@ -67,34 +82,44 @@ class OctreeNCAWarmStartAgent(MedNCAAgent):
 
         if self.exp.config.get('trainer.use_amp', False):
             self.scaler.scale(loss_val).backward()
-            if normalize_grads or track_grads: self.scaler.unscale_(self.optimizer)
-            if normalize_grads or track_grads:
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.detach().data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-            if normalize_grads: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            if track_grads:
-                if not hasattr(self, 'epoch_grad_norm'): self.epoch_grad_norm = []
-                self.epoch_grad_norm.append(total_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            
+            self.accum_iter += 1
+            if self.accum_iter % accum_steps == 0:
+                if normalize_grads or track_grads: self.scaler.unscale_(self.optimizer)
+                if normalize_grads or track_grads:
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.detach().data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+                if normalize_grads: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                if track_grads:
+                    if not hasattr(self, 'epoch_grad_norm'): self.epoch_grad_norm = []
+                    self.epoch_grad_norm.append(total_norm)
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                if self.exp.config['trainer.ema']: self.ema.update()
         else:
             loss_val.backward()
-            if normalize_grads or track_grads:
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.detach().data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-            if normalize_grads: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            if track_grads:
-                if not hasattr(self, 'epoch_grad_norm'): self.epoch_grad_norm = []
-                self.epoch_grad_norm.append(total_norm)
-            self.optimizer.step()
             
-        if self.exp.config['trainer.ema']: self.ema.update()
+            self.accum_iter += 1
+            if self.accum_iter % accum_steps == 0:
+                if normalize_grads or track_grads:
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.detach().data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+                if normalize_grads: torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                if track_grads:
+                    if not hasattr(self, 'epoch_grad_norm'): self.epoch_grad_norm = []
+                    self.epoch_grad_norm.append(total_norm)
+                
+                self.optimizer.step()
+                if self.exp.config['trainer.ema']: self.ema.update()
+            
         return loss_ret
 
     @torch.no_grad()

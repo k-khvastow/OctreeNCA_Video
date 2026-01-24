@@ -48,6 +48,7 @@ def get_study_config():
     study_config['model.channel_n'] = 24
     study_config['model.hidden_size'] = 32
     study_config['trainer.batch_size'] = 1  # Sequence batch size
+    study_config['trainer.gradient_accumulation'] = 8
 
     dice_loss_weight = 1.0
     ema_decay = 0.99
