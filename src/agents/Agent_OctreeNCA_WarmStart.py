@@ -10,7 +10,7 @@ class OctreeNCAWarmStartAgent(MedNCAAgent):
     """
     def __init__(self, model):
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model, mode="reduce-overhead") # none, default, reduce-overhead, max-autotune
             print("Model compiled with torch.compile")
         except Exception as e:
             print(f"Could not compile model: {e}")

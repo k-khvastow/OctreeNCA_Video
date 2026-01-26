@@ -1,12 +1,12 @@
 import configs
-from src.datasets.Dataset_Video2D_Sequential import Video2DSequentialDataset
+from src.datasets.Dataset_Video2D_Sequential_cached import Video2DSequentialDatasetCached
 from src.utils.WarmStartConfig import EXP_OctreeNCA_WarmStart
 from src.utils.Study import Study
 import torch
 import wonderwords
 
-DATA_ROOT = "/vol/data/BioProject13/data_OCT/OCT"
-LABEL_ROOT = "/vol/data/BioProject13/data_OCT/Label/GT_Layers"
+DATA_ROOT = "/vol/data/BioProject13/data_OCT/npy_Cropped_400/"
+LABEL_ROOT = "/vol/data/BioProject13/data_OCT/npy_Cropped_400/"
 r = wonderwords.RandomWord()
 random_word = r.word(include_parts_of_speech=["nouns"])
 
@@ -86,7 +86,7 @@ if __name__ == "__main__":
     exp = EXP_OctreeNCA_WarmStart().createExperiment(
         study_config, 
         detail_config={}, 
-        dataset_class=Video2DSequentialDataset, 
+        dataset_class=Video2DSequentialDatasetCached, 
         dataset_args=dataset_args
     )
     
