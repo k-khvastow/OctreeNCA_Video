@@ -9,11 +9,6 @@ class OctreeNCAWarmStartAgent(MedNCAAgent):
     Expects data input to be (B, T, C, H, W).
     """
     def __init__(self, model):
-        try:
-            model = torch.compile(model, mode="reduce-overhead") # none, default, reduce-overhead, max-autotune
-            print("Model compiled with torch.compile")
-        except Exception as e:
-            print(f"Could not compile model: {e}")
         super().__init__(model)
         self.accum_iter = 0
 

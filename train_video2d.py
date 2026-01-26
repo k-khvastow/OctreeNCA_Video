@@ -18,7 +18,7 @@ def get_study_config():
     study_config = {
         'experiment.name': r'OctreeNCA_Video2D_7Class',
         'experiment.description': 'Training OctreeNCA on 2D video slices from OCTA dataset with 7 classes.',
-        'model.output_channels': 7,
+        'model.output_channels': 6,
         'model.input_channels': 1,
         'experiment.use_wandb': True,
         'experiment.wandb_project': 'OctreeNCA_Video',
@@ -63,6 +63,8 @@ def get_study_config():
     study_config['model.channel_n'] = 24
     study_config['model.hidden_size'] = 32
     study_config['trainer.batch_size'] = 8
+    study_config['model.octree.separate_models'] = True
+    study_config['model.backbone_class'] = "BasicNCA2DFast"
 
     dice_loss_weight = 1.0
     ema_decay = 0.99

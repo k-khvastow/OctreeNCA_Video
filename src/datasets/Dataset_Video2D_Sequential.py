@@ -7,11 +7,12 @@ import cv2
 from src.datasets.Dataset_Base import Dataset_Base
 
 class Video2DSequentialDataset(Dataset_Base):
-    def __init__(self, data_root, label_root, sequence_length=5, num_classes=7, input_size=(400, 400)):
+    def __init__(self, data_root, label_root, sequence_length=5, step=5, num_classes=7, input_size=(400, 400)):
         super().__init__()
         self.data_root = data_root
         self.label_root = label_root
         self.sequence_length = sequence_length
+        self.step = step  # New parameter for frame spacing
         self.num_classes = num_classes
         self.size = input_size 
 
@@ -30,19 +31,33 @@ class Video2DSequentialDataset(Dataset_Base):
                 img_list = natsort.natsorted([x for x in os.listdir(data_path) if x.endswith('.bmp')])
                 num_frames = len(img_list)
                 
-                if num_frames >= sequence_length:
-                    for i in range(0, num_frames - sequence_length + 1):
+                # Calculate the total span required for a sequence with the given step
+                # e.g., length 5, step 5 requires indices: 0, 5, 10, 15, 20.
+                # The span is (sequence_length - 1) * step + 1.
+                required_span = (sequence_length - 1) * step + 1
+                
+                if num_frames >= required_span:
+                    for i in range(0, num_frames - required_span + 1):
                         seq_id = f"{item}_{i}"
+                        
+                        # Generate the list of specific frame indices for this sequence
+                        # e.g., [i, i+5, i+10, i+15, i+20]
+                        indices = [i + j * step for j in range(sequence_length)]
+                        
+                        # Get the corresponding image filenames
+                        seq_img_names = [img_list[idx] for idx in indices]
+                        
                         seq_data = {
                             'folder': item,
                             'start_frame': i,
-                            'image_names': img_list[i : i+sequence_length],
+                            'frame_indices': indices, # Store explicit indices
+                            'image_names': seq_img_names,
                             'id': seq_id
                         }
                         self.sequences.append(seq_data)
                         self.sequences_dict[seq_id] = seq_data
         
-        print(f"Found {len(self.sequences)} valid sequences of length {sequence_length}.")
+        print(f"Found {len(self.sequences)} valid sequences of length {sequence_length} with step {step}.")
 
     def getFilesInPath(self, path: str):
         return {k: {'id': k} for k in self.sequences_dict.keys()}
@@ -61,8 +76,9 @@ class Video2DSequentialDataset(Dataset_Base):
         try:
             meta = self.sequences[index]
             folder = meta['folder']
-            start_frame = meta['start_frame']
+            # start_frame = meta['start_frame'] # Not used for logic anymore, we use frame_indices
             img_names = meta['image_names']
+            frame_indices = meta['frame_indices'] # Use the pre-calculated indices
             
             # Check folder existence
             if not os.path.exists(os.path.join(self.data_root, folder)):
@@ -105,7 +121,8 @@ class Video2DSequentialDataset(Dataset_Base):
             return self.__getitem__((index + 1) % len(self.sequences))
 
         # 3. Load Sequence
-        for i, img_name in enumerate(img_names):
+        # We iterate over BOTH the filenames and the explicit indices to ensure mask matches image
+        for i, (img_name, abs_frame_idx) in enumerate(zip(img_names, frame_indices)):
             img_path = os.path.join(self.data_root, folder, img_name)
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             
@@ -117,9 +134,12 @@ class Video2DSequentialDataset(Dataset_Base):
             # Convert to Float32 and Normalize immediately
             img_processed = img.astype(np.float32) / 255.0
             
-            # Load Mask
-            abs_frame_idx = start_frame + i
+            # Load Mask using the explicit index (e.g. 0, 5, 10...)
             mask = self._generate_mask(layers_data, abs_frame_idx, orig_h, orig_w)
+            
+            # Fix class overflow
+            num_layers = layers_data.shape[0]
+            mask[mask == num_layers] = 0
             
             # Apply Transforms
             if mode == 'crop':
@@ -145,7 +165,7 @@ class Video2DSequentialDataset(Dataset_Base):
         return {
             'image': imgs_np, 
             'label': masks_onehot,
-            'id': f"{folder}_{start_frame}"
+            'id': f"{folder}_{frame_indices[0]}"
         }
 
     def _generate_mask(self, layers_data, frame_idx, h, w):
