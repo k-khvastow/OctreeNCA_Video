@@ -178,6 +178,11 @@ class Video2DDataset(Dataset_Base):
             # Compare original y_grid with original layer coordinates
             mask += (y_grid > layer_surface_expanded).astype(np.float32)
 
+        # The mask values range from 0 to num_layers. 
+        # 0 is the top background, and num_layers is the bottom background.
+        # We set the bottom background (num_layers) to 0 to merge them into a single 'background' class.
+        mask[mask == num_layers] = 0
+        
         # 3. Apply Transformations to BOTH Image and Mask
         if hasattr(self, 'size') and self.size is not None:
              target_size = (self.size[1], self.size[0]) # size is (H, W) -> (W, H)
