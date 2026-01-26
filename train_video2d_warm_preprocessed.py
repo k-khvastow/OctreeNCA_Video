@@ -1,12 +1,12 @@
 import configs
-from src.datasets.Dataset_Video2D_Sequential import Video2DSequentialDataset
+from src.datasets.Dataset_Video2D_Sequential_cached import Video2DSequentialDatasetCached
 from src.utils.WarmStartConfig import EXP_OctreeNCA_WarmStart
 from src.utils.Study import Study
 import torch
 import wonderwords
 
-DATA_ROOT = "/vol/data/BioProject13/data_OCT/OCT"
-LABEL_ROOT = "/vol/data/BioProject13/data_OCT/Label/GT_Layers"
+DATA_ROOT = "/vol/data/BioProject13/data_OCT/npy_Cropped_400/"
+LABEL_ROOT = "/vol/data/BioProject13/data_OCT/npy_Cropped_400/"
 r = wonderwords.RandomWord()
 random_word = r.word(include_parts_of_speech=["nouns"])
 
@@ -36,7 +36,7 @@ def get_study_config():
 
     # Experiment settings
     study_config['experiment.logging.also_eval_on_train'] = False
-    study_config['experiment.save_interval'] = 3
+    study_config['experiment.save_interval'] = 5
     study_config['experiment.logging.evaluate_interval'] = 100
     
     # Model Specifics
@@ -44,10 +44,10 @@ def get_study_config():
     steps = 10
     alpha = 1.0
     study_config['model.octree.res_and_steps'] = [[[400,400], steps], [[200,200], steps], [[100,100], steps], [[50,50], steps], [[25,25], int(alpha * 20)]]
-    study_config['model.octree.warm_start_steps'] = 10  # Reduced steps for warm start
+    study_config['model.octree.warm_start_steps'] = 5  # Reduced steps for warm start
     study_config['model.channel_n'] = 24
     study_config['model.hidden_size'] = 32
-    study_config['trainer.batch_size'] = 3  # Sequence batch size
+    study_config['trainer.batch_size'] = 1  # Sequence batch size
     study_config['trainer.gradient_accumulation'] = 8
 
     dice_loss_weight = 1.0
@@ -55,16 +55,13 @@ def get_study_config():
     study_config['trainer.ema'] = ema_decay > 0.0
     study_config['trainer.ema.decay'] = ema_decay
     study_config['trainer.use_amp'] = True
-    study_config['trainer.normalize_gradients'] = 'batch'
     
-    study_config['trainer.losses'] = ["src.losses.DiceLoss.nnUNetSoftDiceLoss", "src.losses.LossFunctions.CrossEntropyLossWrapper", "src.losses.OverflowLoss.OverflowLoss"]
-    study_config['trainer.losses.parameters'] = [{"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05}, {}, {}]
-    study_config['trainer.loss_weights'] = [dice_loss_weight, 2.0-dice_loss_weight, 1.0]
+    study_config['trainer.losses'] = ["src.losses.DiceLoss.nnUNetSoftDiceLoss", "src.losses.LossFunctions.CrossEntropyLossWrapper"]
+    study_config['trainer.losses.parameters'] = [{"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05}, {}]
+    study_config['trainer.loss_weights'] = [dice_loss_weight, 2.0-dice_loss_weight]
 
     study_config['model.normalization'] = "none"
     study_config['model.apply_nonlin'] = "torch.nn.Softmax(dim=1)"
-    study_config['model.backbone_class'] = "BasicNCA2DFast"
-    study_config['model.octree.separate_models'] = True
 
     study_config['experiment.name'] = f"WarmStart_{random_word}_{study_config['model.channel_n']}"
     
@@ -74,7 +71,7 @@ def get_dataset_args(study_config):
     return {
         'data_root': DATA_ROOT,
         'label_root': LABEL_ROOT,
-        'sequence_length': 5, # Temporal sequence length
+        'sequence_length': 30, # Temporal sequence length
         'num_classes': study_config['model.output_channels'],
         'input_size': study_config['experiment.dataset.input_size']
     }
@@ -89,7 +86,7 @@ if __name__ == "__main__":
     exp = EXP_OctreeNCA_WarmStart().createExperiment(
         study_config, 
         detail_config={}, 
-        dataset_class=Video2DSequentialDataset, 
+        dataset_class=Video2DSequentialDatasetCached, 
         dataset_args=dataset_args
     )
     
