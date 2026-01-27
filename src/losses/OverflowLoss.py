@@ -1,72 +1,62 @@
 import torch
 
-
 class OverflowLoss(torch.nn.Module):
-    r"""Dice BCE Loss
+    r"""
+    OverflowLoss for NCA.
+    Constrains hidden states to [-1, 1] to ensure stability.
+    Optionally ignores output constraints for segmentation tasks.
     """
-    def __init__(self) -> None:
-        r"""Initialisation method of DiceBCELoss
-            #Args:
-                useSigmoid: Whether to use sigmoid
-        """
+    def __init__(self, **kwargs) -> None:
         super().__init__()
     
-
-    def forward(self, output: torch.Tensor, target: torch.Tensor, **kwargs):
+    def forward(self, output: torch.Tensor = None, target: torch.Tensor = None, **kwargs):
         loss_ret = {}
-        loss = 0
+        
+        # 1. Hidden State Overflow (CRITICAL FOR STABILITY)
+        # We must penalize hidden states that go beyond [-1, 1]
+        if 'hidden_channels' in kwargs:
+            hidden: torch.Tensor = kwargs['hidden_channels']
+            hidden_overflow_loss = (hidden - torch.clip(hidden, -1.0, 1.0)).abs().mean()
+            loss_ret['hidden'] = hidden_overflow_loss.item()
+        else:
+            # Fallback if hidden_channels aren't provided (though they should be)
+            hidden_overflow_loss = 0.0
 
-        hidden: torch.Tensor = kwargs['hidden_channels']
+        # 2. Output Overflow (SKIP FOR SEGMENTATION)
+        # For segmentation (logits/probs), we rely on CrossEntropy/Dice, not value clamping.
+        # We define rgb_overflow_loss as 0 to avoid interfering with segmentation learning.
+        rgb_overflow_loss = 0.0
+        loss_ret['rgb'] = 0.0
 
-        hidden_overflow_loss = (hidden - torch.clip(hidden, -1.0, 1.0)).abs().mean()
-        with torch.no_grad():
-            _max = torch.amax(target, dim=tuple(range(1,len(target.shape))), keepdim=True)
-            _min = torch.amin(target, dim=tuple(range(1,len(target.shape))), keepdim=True)
-
-
-        rgb_overflow_loss = (output - torch.clamp(output, _min, _max)).abs().mean()
-
+        # Total loss
         loss = hidden_overflow_loss + rgb_overflow_loss
-        loss_ret['hidden'] = hidden_overflow_loss.item()
-        loss_ret['rgb'] = rgb_overflow_loss.item()
 
         return loss, loss_ret
-    
 
 class MaskedOverflowLoss(torch.nn.Module):
-    r"""Dice BCE Loss
+    r"""
+    Masked version if you are using masks, adapted to ignore output clamping.
     """
-    def __init__(self) -> None:
-        r"""Initialisation method of DiceBCELoss
-            #Args:
-                useSigmoid: Whether to use sigmoid
-        """
+    def __init__(self, **kwargs) -> None:
         super().__init__()
     
-
     def forward(self, **kwargs):
         loss_ret = {}
-        loss = 0
+        
+        # 1. Hidden State Overflow
+        if 'loss_mask' in kwargs and 'hidden_channels' in kwargs:
+            mask: torch.Tensor = kwargs['loss_mask']
+            hidden: torch.Tensor = kwargs['hidden_channels']
+            
+            hidden_dist = (hidden - torch.clip(hidden, -1.0, 1.0)).abs()
+            hidden_overflow_loss = (hidden_dist * mask).sum() / (mask.sum() + 1e-5)
+            loss_ret['hidden'] = hidden_overflow_loss.item()
+        else:
+            hidden_overflow_loss = 0.0
 
-        output = kwargs['pred']
-        target = kwargs['target']
-
-        mask: torch.Tensor = kwargs['loss_mask']
-        hidden: torch.Tensor = kwargs['hidden_channels']
-
-        hidden_overflow_loss = (hidden - torch.clip(hidden, -1.0, 1.0)).abs()
-        with torch.no_grad():
-            _max = torch.amax(target, dim=tuple(range(1,len(target.shape))), keepdim=True)
-            _min = torch.amin(target, dim=tuple(range(1,len(target.shape))), keepdim=True)
-
-
-        rgb_overflow_loss = (output - torch.clamp(output, _min, _max)).abs()
-
-        hidden_overflow_loss = (hidden_overflow_loss * mask).sum() / (mask.sum() + 1e-5)
-        rgb_overflow_loss = (rgb_overflow_loss * mask).sum() / (mask.sum() + 1e-5)
+        # 2. Output Overflow (Skipped)
+        rgb_overflow_loss = 0.0
+        loss_ret['rgb'] = 0.0
 
         loss = hidden_overflow_loss + rgb_overflow_loss
-        loss_ret['hidden'] = hidden_overflow_loss.item()
-        loss_ret['rgb'] = rgb_overflow_loss.item()
-
         return loss, loss_ret

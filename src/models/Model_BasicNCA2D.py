@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
  
 class BasicNCA2D(nn.Module):
-    def __init__(self, channel_n, fire_rate, device, hidden_size=128, input_channels=1, init_method="standard", kernel_size=7, groups=False,
+    def __init__(self, channel_n, fire_rate, device, hidden_size=128, input_channels=1, init_method="standard", kernel_size=9, groups=False,
                  normalization="batch"):
         r"""Init function
             #Args:

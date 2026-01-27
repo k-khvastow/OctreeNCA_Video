@@ -46,8 +46,8 @@ def get_study_config():
     study_config['model.octree.res_and_steps'] = [[[400,400], steps], [[200,200], steps], [[100,100], steps], [[50,50], steps], [[25,25], int(alpha * 20)]]
     study_config['model.octree.warm_start_steps'] = 10  # Reduced steps for warm start
     study_config['model.channel_n'] = 24
-    study_config['model.hidden_size'] = 32
-    study_config['trainer.batch_size'] = 3  # Sequence batch size
+    study_config['model.hidden_size'] = 64
+    study_config['trainer.batch_size'] = 2  # Sequence batch size
     study_config['trainer.gradient_accumulation'] = 8
 
     dice_loss_weight = 1.0
@@ -55,15 +55,16 @@ def get_study_config():
     study_config['trainer.ema'] = ema_decay > 0.0
     study_config['trainer.ema.decay'] = ema_decay
     study_config['trainer.use_amp'] = True
-    study_config['trainer.normalize_gradients'] = 'batch'
+    study_config['trainer.normalize_gradients'] = 'all'
     
-    study_config['trainer.losses'] = ["src.losses.DiceLoss.nnUNetSoftDiceLoss", "src.losses.LossFunctions.CrossEntropyLossWrapper", "src.losses.OverflowLoss.OverflowLoss"]
+    #"src.losses.OverflowLoss.OverflowLoss"
+    study_config['trainer.losses'] = ["src.losses.DiceLoss.nnUNetSoftDiceLoss", "src.losses.LossFunctions.CrossEntropyLossWrapper","src.losses.OverflowLoss.OverflowLoss"]
     study_config['trainer.losses.parameters'] = [{"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05}, {}, {}]
-    study_config['trainer.loss_weights'] = [dice_loss_weight, 2.0-dice_loss_weight, 1.0]
+    study_config['trainer.loss_weights'] = [dice_loss_weight, 2.0-dice_loss_weight, 1]
 
     study_config['model.normalization'] = "none"
     study_config['model.apply_nonlin'] = "torch.nn.Softmax(dim=1)"
-    study_config['model.backbone_class'] = "BasicNCA2DFast"
+    study_config['model.backbone_class'] = "BasicNCA2D"
     study_config['model.octree.separate_models'] = True
 
     study_config['experiment.name'] = f"WarmStart_{random_word}_{study_config['model.channel_n']}"

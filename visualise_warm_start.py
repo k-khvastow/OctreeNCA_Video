@@ -205,4 +205,4 @@ if __name__ == "__main__":
     # Call the function. 
     # Pass 'experiment_name_override' if you want to visualize a specific past run.
     # Otherwise, it picks the latest one.
-    visualize_warm_start(num_samples=2, experiment_name_override="WarmStart_frown_24")
+    visualize_warm_start(num_samples=2, experiment_name_override="Video2D_subsidience_24")
