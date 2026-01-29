@@ -12,7 +12,7 @@ from src.datasets.Dataset_Video2D_Sequential import Video2DSequentialDataset
 from src.utils.WarmStartConfig import EXP_OctreeNCA_WarmStart
 from src.utils.ProjectConfiguration import ProjectConfiguration as pc
 
-def visualize_warm_start(num_samples=2, experiment_name_override=None):
+def visualize_warm_start(num_samples=2, experiment_name_override=None, sequence_length_override=None, step_override=None):
     """
     Visualizes the output of the Warm Start OctreeNCA model on video sequences.
     
@@ -20,6 +20,8 @@ def visualize_warm_start(num_samples=2, experiment_name_override=None):
         num_samples: Number of sequences to visualize.
         experiment_name_override: Exact name of the experiment folder (e.g., 'WarmStart_apple_24').
                                   If None, attempts to find the most recently modified WarmStart experiment.
+        sequence_length_override: Optional int to override the dataset sequence length (e.g., 10).
+        step_override: Optional int to override the dataset step size (e.g., 2).
     """
     
     # 1. Setup Configuration
@@ -46,7 +48,7 @@ def visualize_warm_start(num_samples=2, experiment_name_override=None):
             print(f"Experiments directory not found at {exp_path}")
             return
 
-    # Get Dataset Arguments
+    # Get Dataset Arguments (for experiment reload)
     dataset_args = get_dataset_args(study_config)
     # FIX: Video2DSequentialDataset does not accept 'preload', so we do not add it here.
     
@@ -91,7 +93,29 @@ def visualize_warm_start(num_samples=2, experiment_name_override=None):
 
     # 4. Load Dataset
     print("Loading Dataset (this may take a moment)...")
-    dataset = Video2DSequentialDataset(**dataset_args)
+    # For visualization, allow a different sequence length without breaking reload.
+    vis_dataset_args = dict(dataset_args)
+    if sequence_length_override is not None:
+        try:
+            sequence_length_override = int(sequence_length_override)
+        except (TypeError, ValueError):
+            raise ValueError("sequence_length_override must be an integer.")
+        if sequence_length_override <= 0:
+            raise ValueError("sequence_length_override must be > 0.")
+        vis_dataset_args['sequence_length'] = sequence_length_override
+        print(f"Overriding sequence length to {sequence_length_override}")
+
+    if step_override is not None:
+        try:
+            step_override = int(step_override)
+        except (TypeError, ValueError):
+            raise ValueError("step_override must be an integer.")
+        if step_override <= 0:
+            raise ValueError("step_override must be > 0.")
+        vis_dataset_args['step'] = step_override
+        print(f"Overriding step size to {step_override}")
+
+    dataset = Video2DSequentialDataset(**vis_dataset_args)
     print(f"Dataset loaded. Total sequences: {len(dataset)}")
 
     # 5. Inference & Visualization
@@ -147,8 +171,8 @@ def visualize_warm_start(num_samples=2, experiment_name_override=None):
                 img_t = images_tensor[t].unsqueeze(0) 
                 
                 # -- 2. Forward Pass (Warm Start) --
-                # forward_eval_warm takes input and previous state, returns new state
-                out = exp.agent.model.forward_eval_warm(img_t, prev_state=prev_state)
+                # Use the model's forward to ensure BCHW -> BHWC permutation is applied.
+                out = exp.agent.model(img_t, prev_state=prev_state)
                 
                 # -- 3. Update State for next frame --
                 # The model returns 'final_state' which we feed back into the next step
@@ -205,4 +229,9 @@ if __name__ == "__main__":
     # Call the function. 
     # Pass 'experiment_name_override' if you want to visualize a specific past run.
     # Otherwise, it picks the latest one.
-    visualize_warm_start(num_samples=2, experiment_name_override="Video2D_subsidience_24")
+    visualize_warm_start(
+        num_samples=2,
+        experiment_name_override="WarmStart_conspiracy_24",
+        sequence_length_override=10,
+        step_override=10,
+    )

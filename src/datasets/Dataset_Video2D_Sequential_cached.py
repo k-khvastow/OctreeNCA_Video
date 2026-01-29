@@ -5,13 +5,14 @@ import natsort
 from src.datasets.Dataset_Base import Dataset_Base
 
 class Video2DSequentialDatasetCached(Dataset_Base):
-    def __init__(self, data_root, label_root=None, sequence_length=5, num_classes=7, input_size=(400, 400)):
+    def __init__(self, data_root, label_root=None, sequence_length=5, step=5, num_classes=7, input_size=(400, 400)):
         super().__init__()
         # Point to the folder containing the flat .npz files
         # data_root should be the parent folder, e.g. ".../npy_Cropped_400"
         self.image_root = os.path.join(data_root, "images")
         self.label_root = os.path.join(data_root, "labels")
         self.sequence_length = sequence_length
+        self.step = step
         self.num_classes = num_classes
         self.size = input_size 
 
@@ -38,20 +39,23 @@ class Video2DSequentialDatasetCached(Dataset_Base):
                 patient_groups[patient_id] = []
             patient_groups[patient_id].append(f)
 
-        # 2. Generate Sequences (Sliding Window)
-        # We iterate over the sorted files for each patient
+        # 2. Generate Sequences (Sliding Window with Step)
         for patient_id, file_list in patient_groups.items():
-            # file_list is already natsorted from step 1, but we can ensure it
-            # Logic: We take 'sequence_length' consecutive files available in the folder
             num_frames = len(file_list)
+
+            # The required number of frames to form a sequence with stepping
+            required_span = (self.sequence_length - 1) * self.step + 1
             
-            if num_frames >= sequence_length:
-                for i in range(0, num_frames - sequence_length + 1):
-                    # Identify the window of files
-                    window_files = file_list[i : i+sequence_length]
+            if num_frames >= required_span:
+                # We slide the window one frame at a time
+                for i in range(num_frames - required_span + 1):
+                    # Get the indices for the current sequence based on step
+                    indices = [i + j * self.step for j in range(self.sequence_length)]
                     
-                    # Generate a unique ID for this sequence (Patient_StartFrameIndex)
-                    # We grab the frame index from the first file in the window for the ID
+                    # Select the window of files using the calculated indices
+                    window_files = [file_list[idx] for idx in indices]
+                    
+                    # Use the first file's frame index for the sequence ID
                     start_frame_str = window_files[0].replace('.npz', '').rsplit('_', 1)[1]
                     seq_id = f"{patient_id}_{start_frame_str}"
                     
@@ -64,7 +68,7 @@ class Video2DSequentialDatasetCached(Dataset_Base):
                     self.sequences.append(seq_data)
                     self.sequences_dict[seq_id] = seq_data
 
-        print(f"Found {len(self.sequences)} valid sequences of length {sequence_length}.")
+        print(f"Found {len(self.sequences)} valid sequences of length {sequence_length} with step {self.step}.")
 
     def getFilesInPath(self, path: str):
         # Helper for the Splitter to know what IDs exist
