@@ -28,7 +28,7 @@ def get_study_config():
         'experiment.data_split': [0.7, 0.29, 0.01],
         'experiment.dataset.input_size': (400, 400),
         'experiment.dataset.transform_mode': 'crop', # Options: 'resize', 'crop'
-        'trainer.num_steps_per_epoch': 1000,
+        'trainer.num_steps_per_epoch': 200,
         'trainer.batch_duplication': 1,
         'trainer.n_epochs': 10
     }
@@ -45,6 +45,7 @@ def get_study_config():
     study_config['experiment.logging.evaluate_interval'] = 40
     study_config['experiment.task.score'] = ["src.scores.PatchwiseDiceScore.PatchwiseDiceScore",
                                              "src.scores.PatchwiseIoUScore.PatchwiseIoUScore"]
+    study_config['trainer.n_epochs'] = 100
 
     # OctreeNCA Model Specifics
     steps = 10
@@ -73,15 +74,29 @@ def get_study_config():
 
     study_config['trainer.use_amp'] = True
 
-    study_config['trainer.losses'] = ["src.losses.DiceLoss.nnUNetSoftDiceLoss", "src.losses.LossFunctions.CrossEntropyLossWrapper"]
-    study_config['trainer.losses.parameters'] = [{"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05}, {}]
-    study_config['trainer.loss_weights'] = [dice_loss_weight, 2.0-dice_loss_weight]
+    study_config['trainer.losses'] = ["src.losses.DiceLoss.nnUNetSoftDiceLoss", "src.losses.LossFunctions.CrossEntropyLossWrapper","src.losses.OverflowLoss.OverflowLoss"]
+    study_config['trainer.losses.parameters'] = [{"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05}, {}, {}]
+    study_config['trainer.loss_weights'] = [dice_loss_weight, 2.0-dice_loss_weight, 1]
 
     study_config['model.normalization'] = "none"
     study_config['model.apply_nonlin'] = "torch.nn.Softmax(dim=1)"
 
+    # Spike monitoring (per-batch class counts + save batches on spikes)
+    study_config['experiment.logging.spike_watch.enabled'] = True
+    study_config['experiment.logging.spike_watch.keys'] = [
+        "CrossEntropyLossWrapper/loss",
+        "nnUNetSoftDiceLoss/mask_3",
+        "nnUNetSoftDiceLoss/mask_4",
+    ]
+    study_config['experiment.logging.spike_watch.window'] = 50
+    study_config['experiment.logging.spike_watch.zscore'] = 3.0
+    study_config['experiment.logging.spike_watch.min_value'] = 0.2
+    study_config['experiment.logging.spike_watch.max_images_per_epoch'] = 10
+    study_config['experiment.logging.spike_watch.max_images_per_spike'] = 2
+    study_config['experiment.logging.spike_watch.save_classes'] = [3, 4]
+
     # Update experiment name with params
-    study_config['experiment.name'] = f"Video2D_{random_word}_{study_config['model.channel_n']}"
+    study_config['experiment.name'] = f"Video2D_w3losses_{random_word}_{study_config['model.channel_n']}"
     
     return study_config
 

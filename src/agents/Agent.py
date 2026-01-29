@@ -7,6 +7,7 @@ import torch.optim as optim
 from src.scores.ScoreList import ScoreList
 from src.utils.EMA import EMA
 from src.utils.helper import convert_image, load_json_file, merge_img_label_gt, dump_json_file
+from src.utils.helper import merge_img_label_gt_simplified
 from src.losses.LossFunctions import DiceLoss
 from src.utils.Experiment import Experiment
 import seaborn as sns
@@ -18,6 +19,7 @@ import torchio as tio
 from src.utils.ProjectConfiguration import ProjectConfiguration as pc
 from src.utils.vitca_utils import norm_grad
 import datetime
+from collections import deque
 
 class BaseAgent():
     """Base class for all agents. Handles basic training and only needs to be adapted if special use cases are necessary.
@@ -79,6 +81,121 @@ class BaseAgent():
 
         if self.exp.config.get('trainer.use_amp', False):
              self.scaler = torch.amp.GradScaler('cuda')
+        self._init_spike_watch()
+
+    def _get_config(self, key: str, default=None):
+        return self.exp.config[key] if key in self.exp.config else default
+
+    def _init_spike_watch(self) -> None:
+        self._spike_watch_enabled = bool(self._get_config('experiment.logging.spike_watch.enabled', False))
+        self._spike_watch_keys = self._get_config('experiment.logging.spike_watch.keys', [])
+        self._spike_watch_window = int(self._get_config('experiment.logging.spike_watch.window', 50))
+        self._spike_watch_zscore = float(self._get_config('experiment.logging.spike_watch.zscore', 3.0))
+        self._spike_watch_min_value = float(self._get_config('experiment.logging.spike_watch.min_value', 0.0))
+        self._spike_watch_max_images_per_epoch = int(self._get_config('experiment.logging.spike_watch.max_images_per_epoch', 10))
+        self._spike_watch_max_images_per_spike = int(self._get_config('experiment.logging.spike_watch.max_images_per_spike', 2))
+        self._spike_watch_save_classes = self._get_config('experiment.logging.spike_watch.save_classes', [3, 4])
+        self._spike_watch_history = {k: deque(maxlen=self._spike_watch_window) for k in self._spike_watch_keys}
+        self._spike_watch_epoch_count = 0
+        self._current_global_step = None
+        self._current_epoch = None
+        self._current_batch_index = None
+
+    def _log_batch_class_counts(self, data: dict, loss_ret: dict) -> None:
+        labels = data.get('label', None)
+        if labels is None:
+            return
+        with torch.no_grad():
+            if labels.dim() not in (4, 5):
+                return
+            if labels.dim() == 4:
+                # BCHW
+                counts = labels.sum(dim=(0, 2, 3))
+                total = labels.sum()
+            else:
+                # B C H W D
+                counts = labels.sum(dim=(0, 2, 3, 4))
+                total = labels.sum()
+            for c in range(counts.shape[0]):
+                loss_ret[f"batch_class_pixels/{c}"] = counts[c].item()
+                loss_ret[f"batch_class_frac/{c}"] = (counts[c] / (total + 1e-8)).item()
+
+    def _maybe_log_spike_batch(self, data: dict, out: dict, loss_ret: dict) -> None:
+        if not self._spike_watch_enabled or not self._spike_watch_keys:
+            return
+        if self._current_global_step is None:
+            return
+
+        spike_keys = []
+        for key in self._spike_watch_keys:
+            if key not in loss_ret:
+                continue
+            value = loss_ret[key]
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            history = self._spike_watch_history.setdefault(key, deque(maxlen=self._spike_watch_window))
+            if len(history) >= 5:
+                mean = float(np.mean(history))
+                std = float(np.std(history))
+                threshold = max(self._spike_watch_min_value, mean + self._spike_watch_zscore * std)
+                if std > 0 and value > threshold:
+                    spike_keys.append((key, value, threshold))
+            history.append(value)
+
+        if not spike_keys:
+            return
+        if self._spike_watch_epoch_count >= self._spike_watch_max_images_per_epoch:
+            return
+
+        with torch.no_grad():
+            logits = out.get('logits', None)
+            if logits is None:
+                logits = out.get('probabilities', None)
+            if logits is None:
+                return
+
+            # logits: BHWC, labels: BCHW
+            labels = data.get('label', None)
+            if labels is None:
+                return
+
+            image = data.get('image', None)
+            if image is None:
+                return
+
+            if image.dim() == 4:
+                image_bhwc = image.permute(0, 2, 3, 1)
+            else:
+                return
+
+            gt_bhwc = labels.permute(0, 2, 3, 1)
+            pred_bhwc = logits
+
+            class_idx = [c for c in self._spike_watch_save_classes if c < pred_bhwc.shape[-1]]
+            if len(class_idx) == 0:
+                return
+
+            pred_sel = pred_bhwc[..., class_idx]
+            gt_sel = gt_bhwc[..., class_idx]
+
+            is_rgb = False
+            try:
+                is_rgb = self.exp.datasets['train'].is_rgb
+            except Exception:
+                pass
+
+            max_imgs = min(self._spike_watch_max_images_per_spike, image_bhwc.shape[0])
+            for bi in range(max_imgs):
+                merged = merge_img_label_gt_simplified(
+                    image_bhwc[bi:bi+1],
+                    pred_sel[bi:bi+1],
+                    gt_sel[bi:bi+1],
+                    rgb=is_rgb
+                )
+                for key, value, threshold in spike_keys:
+                    tag = f"spike/{key}/epoch_{self._current_epoch}/step_{self._current_global_step}_b{bi}"
+                    self.exp.write_img(tag, merged, self._current_global_step)
+            self._spike_watch_epoch_count += max_imgs
 
     def printIntermediateResults(self, loss: torch.Tensor, epoch: int) -> None:
         r"""Prints intermediate results of training and adds it to tensorboard
@@ -139,6 +256,9 @@ class BaseAgent():
                 loss, loss_ret = loss_f(**out)
         else:
             loss, loss_ret = loss_f(**out)
+
+        self._log_batch_class_counts(data, loss_ret)
+        self._maybe_log_spike_batch(data, out, loss_ret)
 
         do_backward = False
         if isinstance(loss, torch.Tensor):
@@ -388,20 +508,29 @@ class BaseAgent():
                 self.exp.watch_model(self.model) # Watch model at start of training
             self.exp.set_model_state('train')
             loss_log = {}
+            if getattr(self, '_spike_watch_enabled', False):
+                self._spike_watch_epoch_count = 0
             self.initialize_epoch()
             print('Dataset size: ' + str(len(dataloader)))
             for i, data in enumerate(tqdm(dataloader)):
+                self._current_global_step = (epoch * len(dataloader)) + i
+                self._current_epoch = epoch
+                self._current_batch_index = i
                 loss_item = self.batch_step(data, loss_f)
                 
                 # Step-wise logging
-                global_step = (epoch * len(dataloader)) + i
+                global_step = self._current_global_step
+                for key, value in loss_item.items():
+                    if key.startswith("batch_class_pixels/") or key.startswith("batch_class_frac/"):
+                        val = value.item() if isinstance(value, torch.Tensor) else value
+                        self.exp.write_scalar(f'Loss/train_step/{key}', val, global_step)
                 if i % 10 == 0:
-                     for key, value in loss_item.items():
-                         if isinstance(value, torch.Tensor):
-                             val = value.item()
-                         else:
-                             val = value
-                         self.exp.write_scalar(f'Loss/train_step/{key}', val, global_step)
+                    for key, value in loss_item.items():
+                        if isinstance(value, torch.Tensor):
+                            val = value.item()
+                        else:
+                            val = value
+                        self.exp.write_scalar(f'Loss/train_step/{key}', val, global_step)
 
                 for key in loss_item.keys():
                     if key not in loss_log:
