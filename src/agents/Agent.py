@@ -186,15 +186,18 @@ class BaseAgent():
 
             max_imgs = min(self._spike_watch_max_images_per_spike, image_bhwc.shape[0])
             for bi in range(max_imgs):
-                merged = merge_img_label_gt_simplified(
-                    image_bhwc[bi:bi+1],
-                    pred_sel[bi:bi+1],
-                    gt_sel[bi:bi+1],
-                    rgb=is_rgb
-                )
-                for key, value, threshold in spike_keys:
-                    tag = f"spike/{key}/epoch_{self._current_epoch}/step_{self._current_global_step}_b{bi}"
-                    self.exp.write_img(tag, merged, self._current_global_step)
+                try:
+                    merged = merge_img_label_gt_simplified(
+                        image_bhwc[bi:bi+1],
+                        pred_sel[bi:bi+1],
+                        gt_sel[bi:bi+1],
+                        rgb=is_rgb
+                    )
+                    for key, value, threshold in spike_keys:
+                        tag = f"spike/{key}/epoch_{self._current_epoch}/step_{self._current_global_step}_b{bi}"
+                        self.exp.write_img(tag, merged, self._current_global_step)
+                except Exception as e:
+                    print(f"[spike_watch] Skipped visualization for batch {self._current_global_step} (b{bi}): {e}")
             self._spike_watch_epoch_count += max_imgs
 
     def printIntermediateResults(self, loss: torch.Tensor, epoch: int) -> None:
@@ -250,6 +253,8 @@ class BaseAgent():
         #print(outputs.shape, targets.shape)
         #2D: outputs: BHWC, targets: BHWC
         out["target_unpatched"] = data["label"]
+        if "label_dist" in data:
+            out["target_dist"] = data["label_dist"]
         if self.exp.config.get('trainer.use_amp', False):
             # Using AMP
             with torch.amp.autocast('cuda'):

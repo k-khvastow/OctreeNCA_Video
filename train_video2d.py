@@ -11,6 +11,9 @@ import wonderwords
 
 DATA_ROOT = "/vol/data/BioProject13/data_OCT/OCT"
 LABEL_ROOT = "/vol/data/BioProject13/data_OCT/Label/GT_Layers"
+# Optional: train only a subset of foreground classes (background 0 is always kept).
+# Example: [1, 2] -> model outputs 3 classes (background + 2 selected).
+SELECTED_CLASSES = None  # e.g. [1, 2]
 r = wonderwords.RandomWord()
 random_word = r.word(include_parts_of_speech=["nouns"])
 
@@ -59,24 +62,44 @@ def get_study_config():
     # Actually, the user's OctreeNCAV2 implementation seems to handle levels.
     # Let's set a resolution hierarchy.
     # Adjust resolutions for 400x400 input
-    study_config['model.octree.res_and_steps'] = [[[400,400], steps], [[200,200], steps], [[100,100], steps], [[50,50], steps], [[25,25], int(alpha * 20)]]
+    study_config['model.octree.res_and_steps'] = [[[400,400], steps * 2], [[200,200], steps], [[100,100], steps], [[50,50], steps], [[25,25], int(alpha * 20 / 2)]]
+    study_config['model.kernel_size'] = [5, 5, 5, 5, 5]
 
     study_config['model.channel_n'] = 24
     study_config['model.hidden_size'] = 32
-    study_config['trainer.batch_size'] = 8
+    study_config['trainer.batch_size'] = 6
     study_config['model.octree.separate_models'] = True
     study_config['model.backbone_class'] = "BasicNCA2DFast"
 
     dice_loss_weight = 1.0
+    boundary_loss_weight = 0.001
     ema_decay = 0.99
     study_config['trainer.ema'] = ema_decay > 0.0
     study_config['trainer.ema.decay'] = ema_decay
 
     study_config['trainer.use_amp'] = True
 
-    study_config['trainer.losses'] = ["src.losses.DiceLoss.nnUNetSoftDiceLoss", "src.losses.LossFunctions.CrossEntropyLossWrapper","src.losses.OverflowLoss.OverflowLoss"]
-    study_config['trainer.losses.parameters'] = [{"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05}, {}, {}]
-    study_config['trainer.loss_weights'] = [dice_loss_weight, 2.0-dice_loss_weight, 1]
+    study_config['trainer.losses'] = [
+        "src.losses.DiceLoss.GeneralizedDiceLoss",
+        # "src.losses.LossFunctions.CrossEntropyLossWrapper",
+        # "src.losses.OverflowLoss.OverflowLoss",
+        "src.losses.DiceLoss.BoundaryLoss",
+    ]
+    study_config['trainer.losses.parameters'] = [
+        {"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05},
+        {},
+        {},
+        {"do_bg": False, "channel_last": True, "use_precomputed": True, "use_probabilities": False, "dist_clip": 20.0},
+    ]
+    study_config['trainer.loss_weights'] = [
+        dice_loss_weight,
+        # 2.0 - dice_loss_weight,
+        # 1,
+        boundary_loss_weight,
+    ]
+
+    study_config['experiment.dataset.precompute_boundary_dist'] = False
+    study_config['experiment.dataset.boundary_dist_classes'] = None
 
     study_config['model.normalization'] = "none"
     study_config['model.apply_nonlin'] = "torch.nn.Softmax(dim=1)"
@@ -93,7 +116,27 @@ def get_study_config():
     study_config['experiment.logging.spike_watch.min_value'] = 0.2
     study_config['experiment.logging.spike_watch.max_images_per_epoch'] = 10
     study_config['experiment.logging.spike_watch.max_images_per_spike'] = 2
-    study_config['experiment.logging.spike_watch.save_classes'] = [3, 4]
+    study_config['experiment.logging.spike_watch.save_classes'] = [1, 2, 3, 4, 5]
+
+    # Optional class subset selection (foreground classes only; background is always class 0)
+    selected_classes = SELECTED_CLASSES
+    if selected_classes is not None:
+        cleaned = []
+        seen = set()
+        for c in selected_classes:
+            c_int = int(c)
+            if c_int == 0:
+                continue
+            if c_int not in seen:
+                cleaned.append(c_int)
+                seen.add(c_int)
+        if len(cleaned) == 0:
+            raise ValueError("SELECTED_CLASSES must include at least one non-zero class id.")
+        study_config['experiment.dataset.class_subset'] = cleaned
+        study_config['model.output_channels'] = len(cleaned) + 1
+        study_config['experiment.logging.spike_watch.save_classes'] = list(range(1, len(cleaned) + 1))
+    else:
+        study_config['experiment.dataset.class_subset'] = None
 
     # Update experiment name with params
     study_config['experiment.name'] = f"Video2D_w3losses_{random_word}_{study_config['model.channel_n']}"
@@ -107,7 +150,10 @@ def get_dataset_args(study_config):
         'preload': False, # Set to True if RAM allows
         'num_classes': study_config['model.output_channels'],
         'transform_mode': study_config['experiment.dataset.transform_mode'],
-        'input_size': study_config['experiment.dataset.input_size']
+        'input_size': study_config['experiment.dataset.input_size'],
+        'class_subset': study_config.get('experiment.dataset.class_subset', None),
+        'precompute_boundary_dist': study_config.get('experiment.dataset.precompute_boundary_dist', False),
+        'boundary_dist_classes': study_config.get('experiment.dataset.boundary_dist_classes', None),
     }
 
 # Prepare Study and Experiment

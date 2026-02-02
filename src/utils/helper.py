@@ -143,6 +143,12 @@ def merge_img_label_gt_simplified(img: torch.Tensor, pred: torch.Tensor, gt: tor
         assert len(img.shape) == len(pred.shape) == len(gt.shape) == 4
 
     # all: BHWC
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu()
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu()
+    if isinstance(gt, torch.Tensor):
+        gt = gt.detach().cpu()
 
     img = normalize_image(img)
 
