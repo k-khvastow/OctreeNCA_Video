@@ -19,6 +19,8 @@ class UNetAgent(Agent_MedSeg2D, Agent_MedSeg3D):
         id, inputs, targets = data['id'], data['image'], data['label']
         inputs, targets = inputs.type(torch.FloatTensor), targets.type(torch.FloatTensor)
         inputs, targets = inputs.to(self.device), targets.to(self.device)
+        if 'label_dist' in data:
+            data['label_dist'] = data['label_dist'].type(torch.FloatTensor).to(self.device)
         
         #2D: inputs: BHWC, targets: BHWC
 

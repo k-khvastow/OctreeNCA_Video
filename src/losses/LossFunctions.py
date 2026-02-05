@@ -1,6 +1,47 @@
 import torch
 import torch.nn.functional as F
 
+def _to_channels_first(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() == 4:
+        # BHWC -> BCHW if last dim looks like channels.
+        if tensor.shape[-1] < tensor.shape[1]:
+            return tensor.permute(0, 3, 1, 2)
+    elif tensor.dim() == 5:
+        # BHWDC -> BCDHW if last dim looks like channels.
+        if tensor.shape[-1] < tensor.shape[1]:
+            return tensor.permute(0, 4, 1, 2, 3)
+    return tensor
+
+def soft_tversky_score(
+    output: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float,
+    beta: float,
+    smooth: float = 0.0,
+    eps: float = 1e-7,
+    dims=None,
+) -> torch.Tensor:
+    """Soft Tversky score (multiclass-friendly)."""
+    assert output.size() == target.size()
+
+    if dims is not None:
+        output_sum = torch.sum(output, dim=dims)
+        target_sum = torch.sum(target, dim=dims)
+        difference = (output - target).abs().sum(dim=dims)
+    else:
+        output_sum = torch.sum(output)
+        target_sum = torch.sum(target)
+        difference = (output - target).abs().sum()
+
+    intersection = (output_sum + target_sum - difference) / 2.0  # TP
+    fp = output_sum - intersection
+    fn = target_sum - intersection
+
+    tversky_score = (intersection + smooth) / (
+        intersection + alpha * fp + beta * fn + smooth
+    ).clamp_min(eps)
+    return tversky_score
+
 class DiceLoss(torch.nn.Module):
     r"""Dice Loss
     """
@@ -118,34 +159,174 @@ class BCELoss(torch.nn.Module):
         return BCE
 
 class FocalLoss(torch.nn.Module):
-    r"""Focal Loss
-    """
-    def __init__(self, gamma: float = 2, eps: float = 1e-7) -> None:
-        r"""Initialisation method of DiceBCELoss
-            #Args:
-                gamma
-                eps
-        """
-        super(FocalLoss, self).__init__()
+    r"""Multi-class Focal Loss for segmentation (logits + class indices)."""
+    def __init__(self, gamma: float = 2.0, alpha=None, ignore_index: int = -100, reduction: str = "mean"):
+        super().__init__()
         self.gamma = gamma
+        self.alpha = alpha  # None, scalar, or tensor/list of shape [C]
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor = None, target: torch.Tensor = None, logits=None, x=None, y=None, **kwargs) -> torch.Tensor:
+        # Support common wrapper kwargs: logits/target or x/y.
+        if input is None:
+            input = logits if logits is not None else x
+        if target is None:
+            target = y
+
+        # input: [B, C, H, W], target: [B, H, W] (class indices) or one-hot [B, C, H, W]
+        if target.dtype in (torch.float16, torch.float32) and target.dim() == 4:
+            target = torch.argmax(target, dim=1)
+
+        log_probs = F.log_softmax(input, dim=1)  # [B, C, H, W]
+        probs = log_probs.exp()
+
+        # gather p_t and log_p_t
+        target = target.unsqueeze(1)  # [B, 1, H, W]
+        log_p_t = log_probs.gather(1, target).squeeze(1)  # [B, H, W]
+        p_t = probs.gather(1, target).squeeze(1)
+
+        # mask ignore_index
+        if self.ignore_index is not None:
+            valid = (target.squeeze(1) != self.ignore_index)
+            log_p_t = log_p_t[valid]
+            p_t = p_t[valid]
+        else:
+            valid = None
+
+        focal = -(1 - p_t) ** self.gamma * log_p_t
+
+        if self.alpha is not None:
+            if not torch.is_tensor(self.alpha):
+                alpha = torch.tensor(self.alpha, device=input.device, dtype=input.dtype)
+            else:
+                alpha = self.alpha.to(input.device, input.dtype)
+            # alpha per pixel based on target class
+            alpha_t = alpha.gather(0, target.squeeze(1).clamp_min(0))
+            if valid is not None:
+                alpha_t = alpha_t[valid]
+            focal = focal * alpha_t
+
+        if self.reduction == "mean":
+            return focal.mean()
+        if self.reduction == "sum":
+            return focal.sum()
+        return focal
+
+
+class TverskyLoss(torch.nn.Module):
+    r"""Multiclass Tversky Loss for segmentation.
+
+    Expects logits/probabilities shaped [B, C, H, W] or [B, C, H, W, D] (channels first),
+    or [B, H, W, C] / [B, H, W, D, C] (channels last). Targets can be class indices
+    [B, H, W] / [B, H, W, D] or one-hot with the same shape as logits.
+    """
+    def __init__(
+        self,
+        alpha: float = 0.5,
+        beta: float = 0.5,
+        gamma: float = 1.0,
+        from_logits: bool = True,
+        log_loss: bool = False,
+        smooth: float = 0.0,
+        eps: float = 1e-7,
+        ignore_index: int = None,
+        classes=None,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.from_logits = from_logits
+        self.log_loss = log_loss
+        self.smooth = smooth
         self.eps = eps
+        self.ignore_index = ignore_index
+        self.classes = classes
+        self.reduction = reduction
 
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        r"""Forward function
-            #Args:
-                input: input array
-                target: target array
-        """
-        input = torch.sigmoid(input)
-        input = torch.flatten(input)
-        target = torch.flatten(target)
+    def _prepare_target(self, target: torch.Tensor, num_classes: int, input_dim: int):
+        valid_mask = None
+        is_one_hot = (
+            target.dim() == input_dim
+            and (target.shape[1] == num_classes or target.shape[-1] == num_classes)
+        )
 
-        logit = F.softmax(input, dim=-1)
-        logit = logit.clamp(self.eps, 1. - self.eps)
+        if is_one_hot:
+            # One-hot / soft target.
+            target = _to_channels_first(target)
+            if target.shape[1] != num_classes and target.shape[-1] == num_classes:
+                if target.dim() == 4:
+                    target = target.permute(0, 3, 1, 2)
+                else:
+                    target = target.permute(0, 4, 1, 2, 3)
+        else:
+            # Class indices (optionally with a singleton channel dim).
+            if target.dim() == input_dim and target.shape[1] == 1:
+                target = target.squeeze(1)
+            elif target.dim() == input_dim and target.shape[-1] == 1:
+                target = target.squeeze(-1)
 
-        loss_bce = torch.nn.functional.binary_cross_entropy(input, target, reduction='mean')
-        loss = loss_bce * (1 - logit) ** self.gamma  # focal loss
-        loss = loss.mean()
+            target = target.long()
+            if self.ignore_index is not None:
+                valid_mask = target != self.ignore_index
+                target = target.clone()
+                target[~valid_mask] = 0
+            target = F.one_hot(target, num_classes=num_classes)
+            if target.dim() == 4:
+                target = target.permute(0, 3, 1, 2)
+            else:
+                target = target.permute(0, 4, 1, 2, 3)
+
+        return target, valid_mask
+
+    def forward(self, input: torch.Tensor = None, target: torch.Tensor = None, logits=None, x=None, y=None, **kwargs) -> torch.Tensor:
+        # Support common wrapper kwargs: logits/target or x/y.
+        if input is None:
+            input = logits if logits is not None else x
+        if target is None:
+            target = y
+        if input is None or target is None:
+            raise ValueError("TverskyLoss requires input/logits and target.")
+
+        input = _to_channels_first(input)
+        input_dim = input.dim()
+        num_classes = input.shape[1]
+
+        if self.from_logits:
+            probs = F.softmax(input, dim=1)
+        else:
+            probs = input
+
+        target, valid_mask = self._prepare_target(target, num_classes, input_dim)
+
+        if valid_mask is not None:
+            mask = valid_mask.unsqueeze(1).to(dtype=probs.dtype)
+            probs = probs * mask
+            target = target * mask
+
+        if self.classes is not None:
+            probs = probs[:, self.classes]
+            target = target[:, self.classes]
+
+        dims = tuple([0] + list(range(2, probs.dim())))
+        score = soft_tversky_score(
+            probs, target, self.alpha, self.beta, self.smooth, self.eps, dims
+        )
+
+        if self.log_loss:
+            loss = -torch.log(score.clamp_min(self.eps))
+        else:
+            loss = 1.0 - score
+
+        if self.gamma != 1.0:
+            loss = loss ** self.gamma
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
         return loss
 
 

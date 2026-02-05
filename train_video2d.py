@@ -62,7 +62,7 @@ def get_study_config():
     # Actually, the user's OctreeNCAV2 implementation seems to handle levels.
     # Let's set a resolution hierarchy.
     # Adjust resolutions for 400x400 input
-    study_config['model.octree.res_and_steps'] = [[[400,400], steps * 2], [[200,200], steps], [[100,100], steps], [[50,50], steps], [[25,25], int(alpha * 20 / 2)]]
+    study_config['model.octree.res_and_steps'] = [[[400,400], steps], [[200,200], steps], [[100,100], steps], [[50,50], steps], [[25,25], int(alpha * 20)]]
     study_config['model.kernel_size'] = [5, 5, 5, 5, 5]
 
     study_config['model.channel_n'] = 24
@@ -72,7 +72,7 @@ def get_study_config():
     study_config['model.backbone_class'] = "BasicNCA2DFast"
 
     dice_loss_weight = 1.0
-    boundary_loss_weight = 0.001
+    boundary_loss_weight = 0.2
     ema_decay = 0.99
     study_config['trainer.ema'] = ema_decay > 0.0
     study_config['trainer.ema.decay'] = ema_decay
@@ -81,19 +81,19 @@ def get_study_config():
 
     study_config['trainer.losses'] = [
         "src.losses.DiceLoss.GeneralizedDiceLoss",
-        # "src.losses.LossFunctions.CrossEntropyLossWrapper",
+        "src.losses.LossFunctions.FocalLoss",
         # "src.losses.OverflowLoss.OverflowLoss",
         "src.losses.DiceLoss.BoundaryLoss",
     ]
     study_config['trainer.losses.parameters'] = [
         {"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05},
-        {},
+        {"gamma": 2.0, "alpha": None, "ignore_index": -100, "reduction": "mean"},
         {},
         {"do_bg": False, "channel_last": True, "use_precomputed": True, "use_probabilities": False, "dist_clip": 20.0},
     ]
     study_config['trainer.loss_weights'] = [
         dice_loss_weight,
-        # 2.0 - dice_loss_weight,
+        2.0 - dice_loss_weight,
         # 1,
         boundary_loss_weight,
     ]
@@ -107,7 +107,7 @@ def get_study_config():
     # Spike monitoring (per-batch class counts + save batches on spikes)
     study_config['experiment.logging.spike_watch.enabled'] = True
     study_config['experiment.logging.spike_watch.keys'] = [
-        "CrossEntropyLossWrapper/loss",
+        "FocalLoss/loss",
         "nnUNetSoftDiceLoss/mask_3",
         "nnUNetSoftDiceLoss/mask_4",
     ]
