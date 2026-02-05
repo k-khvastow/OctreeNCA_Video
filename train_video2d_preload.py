@@ -11,7 +11,8 @@ import numpy as np
 from multiprocessing import Manager
 from src.utils.ExperimentWrapper import ExperimentWrapper
 from src.losses.WeightedLosses import WeightedLosses
-from src.models.Model_OctreeNCA_2d_patching2 import OctreeNCA2DPatch2
+# from src.models.Model_OctreeNCA_2d_patching2 import OctreeNCA2DPatch2
+from src.models.test_OctreeNCA3 import OctreeNCA2DPatch2 # As a test
 
 # ==========================================
 # 1. Custom Dataset with Shared Cache
