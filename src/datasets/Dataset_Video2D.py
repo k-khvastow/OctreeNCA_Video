@@ -6,11 +6,13 @@ import scipy.io
 import natsort
 import cv2
 from src.datasets.Dataset_Base import Dataset_Base
+from src.utils.DistanceMaps import signed_distance_map
 
 import pickle
 
 class Video2DDataset(Dataset_Base):
-    def __init__(self, data_root, label_root, preload=False, num_classes=8, transform_mode='resize', input_size=None):
+    def __init__(self, data_root, label_root, preload=False, num_classes=8, transform_mode='resize', input_size=None,
+                 class_subset=None, precompute_boundary_dist: bool = False, boundary_dist_classes=None):
         super().__init__()
         """
         Args:
@@ -20,6 +22,9 @@ class Video2DDataset(Dataset_Base):
             num_classes (int): Number of segmentation classes (output channels).
             transform_mode (str): 'resize' or 'crop'.
             input_size (tuple/list): (Height, Width) target size using for resizing/cropping.
+            class_subset (list[int] | None): Foreground class ids to keep. Others are mapped to background (0).
+            precompute_boundary_dist (bool): If True, compute signed distance maps per sample (CPU).
+            boundary_dist_classes (list[int] | None): Optional class ids to compute distance maps for.
         """
         self.data_root = data_root
         self.label_root = label_root
@@ -30,6 +35,26 @@ class Video2DDataset(Dataset_Base):
             # self.size expected as (H, W) or (D, H, W)?
             # In load_sample: target_size = (self.size[1], self.size[0]) implies self.size is (H, W).
             self.size = input_size
+        self.class_subset = None
+        self.class_map = None
+        self._class_subset_validated = False
+        self.precompute_boundary_dist = precompute_boundary_dist
+        self.boundary_dist_classes = boundary_dist_classes
+        if class_subset is not None:
+            cleaned = []
+            seen = set()
+            for c in class_subset:
+                c_int = int(c)
+                if c_int == 0:
+                    continue
+                if c_int not in seen:
+                    cleaned.append(c_int)
+                    seen.add(c_int)
+            if len(cleaned) == 0:
+                raise ValueError("class_subset must include at least one non-zero class id.")
+            self.class_subset = cleaned
+            self.class_map = {c: i + 1 for i, c in enumerate(self.class_subset)}
+            self.num_classes = len(self.class_subset) + 1
 
         # Attributes required by Agent_UNet / Agent_MedNCA
         self.slice = -1 
@@ -82,7 +107,13 @@ class Video2DDataset(Dataset_Base):
             os.makedirs(cache_dir, exist_ok=True)
             
             size_str = f"{input_size[0]}x{input_size[1]}" if input_size else "ORIG"
-            cache_filename = f"preload_cache_c{num_classes}_{transform_mode}_{size_str}.pkl"
+            class_tag = "all" if self.class_subset is None else "cls" + "-".join(str(c) for c in self.class_subset)
+            dist_tag = ""
+            if self.precompute_boundary_dist:
+                dist_tag = "_dist"
+                if self.boundary_dist_classes is not None:
+                    dist_tag += "c" + "-".join(str(c) for c in self.boundary_dist_classes)
+            cache_filename = f"preload_cache_{class_tag}_c{self.num_classes}_{transform_mode}_{size_str}{dist_tag}.pkl"
             cache_path = os.path.join(cache_dir, cache_filename)
 
             if os.path.exists(cache_path):
@@ -163,6 +194,15 @@ class Video2DDataset(Dataset_Base):
         
         # Check standard consistency
         num_layers = layers_data.shape[0]
+        if self.class_subset is not None and not self._class_subset_validated:
+            max_class = num_layers - 1
+            invalid = [c for c in self.class_subset if c < 0 or c > max_class]
+            if invalid:
+                raise ValueError(
+                    f"class_subset contains invalid ids {invalid}. "
+                    f"Valid class ids are 0..{max_class} for label {label_path}."
+                )
+            self._class_subset_validated = True
         total_frames = layers_data.shape[1]
         
         if frame_idx >= total_frames:
@@ -216,18 +256,40 @@ class Video2DDataset(Dataset_Base):
         # Image: (H, W) -> (H, W, 1)
         img = img[..., np.newaxis]
         
+        if self.class_map is not None:
+            mask_int = mask.astype(np.int64)
+            remapped = np.zeros_like(mask_int)
+            for src, dst in self.class_map.items():
+                remapped[mask_int == src] = dst
+            mask = remapped
+        else:
+            mask = mask.astype(np.int64)
+
         # Label: One-Hot Encoding
         mask_tensor = torch.from_numpy(mask).long()
         label_onehot = torch.nn.functional.one_hot(mask_tensor, num_classes=self.num_classes).numpy().astype(np.float32)
+
+        label_dist = None
+        if self.precompute_boundary_dist:
+            label_dist = signed_distance_map(
+                label_onehot,
+                class_ids=self.boundary_dist_classes,
+                channel_first=False,
+                compact=False,
+                dtype=np.float32,
+            )
         
-        return {
-            'image': img, 
+        sample = {
+            'image': img,
             'label': label_onehot,
             'id': f"{folder}_{frame_idx}",
             'patient_id': meta['id'],
             'folder': folder,
-            'frame_index': frame_idx
+            'frame_index': frame_idx,
         }
+        if label_dist is not None:
+            sample['label_dist'] = label_dist
+        return sample
 
     # Simple LRU-1 cache for the .mat file content
     _last_mat_path = None
