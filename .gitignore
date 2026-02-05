@@ -206,3 +206,4 @@ wandb/
 <path>/
 visualisationOCT/
 inference_reports/
+ioct_data/*
