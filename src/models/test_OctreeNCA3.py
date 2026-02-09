@@ -3,6 +3,7 @@
 ###############################################
 
 from src.models.Model_BasicNCA2D import BasicNCA2D
+# from src.models.test_OctreeNCA import BasicNCA2D # Test
 from src.models.Model_BasicNCA2D_fast import BasicNCA2DFast
 from src.models.Model_ViTCA import ViTCA
 
