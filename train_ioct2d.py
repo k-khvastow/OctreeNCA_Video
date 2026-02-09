@@ -5,11 +5,13 @@ from src.utils.BaselineConfigs import EXP_OctreeNCA
 from src.utils.Study import Study
 import wonderwords
 from pathlib import Path
+import os
 import numpy as np
 from PIL import Image
 import torch
 
 from src.datasets.Dataset_Base import Dataset_Base
+from src.utils.DistanceMaps import signed_distance_map
 
 
 # iOCT dataset root (contains peeling/ and sri/ subfolders)
@@ -21,6 +23,16 @@ SELECTED_CLASSES = None  # e.g. [1, 2]
 
 DATASETS = ["peeling", "sri"]
 VIEWS = ["A", "B"]
+
+# Torch compile controls for this training script.
+ENABLE_TORCH_COMPILE = os.getenv("IOCT_TORCH_COMPILE", "1") == "1"
+TORCH_COMPILE_MODE = os.getenv("IOCT_TORCH_COMPILE_MODE", "max-autotune") # "default", "reduce-overhead", "max-autotune", "max-autotune-internal", "loose", "force_fallback"
+TORCH_COMPILE_BACKEND = os.getenv("IOCT_TORCH_COMPILE_BACKEND", "inductor")
+TORCH_COMPILE_DYNAMIC = os.getenv("IOCT_TORCH_COMPILE_DYNAMIC", "0") == "1"
+TORCH_COMPILE_FULLGRAPH = os.getenv("IOCT_TORCH_COMPILE_FULLGRAPH", "0") == "1"
+ENABLE_GRAD_NORM_LOGGING = os.getenv("IOCT_TRACK_GRAD_NORM", "0") == "1"
+_tbptt_env = os.getenv("IOCT_TBPTT_STEPS", "").strip()
+BACKBONE_TBPTT_STEPS = int(_tbptt_env) if _tbptt_env else None
 
 r = wonderwords.RandomWord()
 random_word = r.word(include_parts_of_speech=["nouns"])
@@ -40,6 +52,7 @@ class iOCTDatasetForExperiment(Dataset_Base):
         (61, 255, 0): 3,       # Class 3 (green)
         (0, 78, 255): 4,       # Class 4 (blue)
         (255, 189, 0): 5,      # Class 5 (yellow/orange)
+        (218, 0, 255): 6,      # Class 6 (magenta)
     }
 
     def __init__(
@@ -47,9 +60,11 @@ class iOCTDatasetForExperiment(Dataset_Base):
         data_root: str,
         datasets=DATASETS,
         views=VIEWS,
-        num_classes: int = 6,
+        num_classes: int = 7,
         input_size=(512, 512),
         class_subset=None,
+        precompute_boundary_dist: bool = False,
+        boundary_dist_classes=None,
     ):
         super().__init__()
         self.data_root = Path(data_root)
@@ -57,6 +72,8 @@ class iOCTDatasetForExperiment(Dataset_Base):
         self.views = views
         self.num_classes = num_classes
         self.size = input_size
+        self.precompute_boundary_dist = precompute_boundary_dist
+        self.boundary_dist_classes = boundary_dist_classes
 
         # Required by agents
         self.slice = -1
@@ -149,14 +166,17 @@ class iOCTDatasetForExperiment(Dataset_Base):
         # Convert segmentation to class indices
         seg = self._rgb_to_class(seg_rgb)
 
-        # Resize to target size (H, W)
-        if hasattr(self, "size") and self.size is not None and img.shape != tuple(self.size):
-            img = np.array(Image.fromarray(img).resize(
-                (self.size[1], self.size[0]), Image.BILINEAR
-            ))
-            seg = np.array(Image.fromarray(seg.astype(np.uint8)).resize(
-                (self.size[1], self.size[0]), Image.NEAREST
-            ))
+        # No resizing in this training script: enforce expected native size.
+        if hasattr(self, "size") and self.size is not None:
+            expected_size = tuple(self.size)
+            if img.shape != expected_size:
+                raise ValueError(
+                    f"Image shape {img.shape} does not match expected size {expected_size} for {info['id']}."
+                )
+            if seg.shape != expected_size:
+                raise ValueError(
+                    f"Segmentation shape {seg.shape} does not match expected size {expected_size} for {info['id']}."
+                )
 
         # Optional class subset remap
         if self.class_map is not None:
@@ -171,9 +191,24 @@ class iOCTDatasetForExperiment(Dataset_Base):
 
         # One-hot encode label to (H, W, C)
         seg_tensor = torch.from_numpy(seg).long()
+        max_class = int(seg_tensor.max().item())
+        if max_class >= self.num_classes:
+            raise ValueError(
+                f"Segmentation class id {max_class} is >= num_classes ({self.num_classes}). "
+                "Update model.output_channels or class_subset to cover all label ids."
+            )
         label_onehot = torch.nn.functional.one_hot(seg_tensor, num_classes=self.num_classes).numpy().astype(np.float32)
+        label_dist = None
+        if self.precompute_boundary_dist:
+            label_dist = signed_distance_map(
+                label_onehot,
+                class_ids=self.boundary_dist_classes,
+                channel_first=False,
+                compact=False,
+                dtype=np.float32,
+            )
 
-        return {
+        sample = {
             "image": img,
             "label": label_onehot,
             "id": info["id"],
@@ -182,6 +217,9 @@ class iOCTDatasetForExperiment(Dataset_Base):
             "view": info["view"],
             "path": str(info["image_path"]),
         }
+        if label_dist is not None:
+            sample["label_dist"] = label_dist
+        return sample
 
 
 def _build_octree_resolutions(input_size, steps, final_steps):
@@ -201,10 +239,11 @@ def _build_octree_resolutions(input_size, steps, final_steps):
 
 
 def get_study_config():
+    full_num_classes = max(iOCTDatasetForExperiment.RGB_TO_CLASS.values()) + 1
     study_config = {
         "experiment.name": r"OctreeNCA_iOCT_2D",
         "experiment.description": "Training OctreeNCA on iOCT 2D frames.",
-        "model.output_channels": 6,
+        "model.output_channels": full_num_classes,
         "model.input_channels": 1,
         "experiment.use_wandb": True,
         "experiment.wandb_project": "OctreeNCA_Video",
@@ -213,7 +252,7 @@ def get_study_config():
         "experiment.dataset.seed": 42,
         "experiment.data_split": [0.8, 0.1, 0.1],
         "experiment.dataset.input_size": (512, 512),
-        "experiment.dataset.transform_mode": "resize",
+        "experiment.dataset.transform_mode": "none",
         "trainer.num_steps_per_epoch": 200,
         "trainer.batch_duplication": 1,
         "trainer.n_epochs": 10,
@@ -246,7 +285,7 @@ def get_study_config():
 
     study_config["model.channel_n"] = 24
     study_config["model.hidden_size"] = 32
-    study_config["trainer.batch_size"] = 6
+    study_config["trainer.batch_size"] = 4
     study_config["model.octree.separate_models"] = True
     study_config["model.backbone_class"] = "BasicNCA2DFast"
 
@@ -265,9 +304,9 @@ def get_study_config():
     ]
     study_config["trainer.losses.parameters"] = [
         {"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05},
-        {"gamma": 2.0, "alpha": None, "ignore_index": -100, "reduction": "mean"},
-        {},
-        {"do_bg": False, "channel_last": True, "use_precomputed": True, "use_probabilities": False, "dist_clip": 20.0},
+        {"gamma": 2.0, "alpha": None, "ignore_index": 0, "reduction": "mean"},
+        {"do_bg": False, "channel_last": True, "use_precomputed": True, "use_probabilities": False, "dist_clip": 20.0,
+         "compute_missing_dist": False},
     ]
     study_config["trainer.loss_weights"] = [
         dice_loss_weight,
@@ -275,16 +314,25 @@ def get_study_config():
         boundary_loss_weight,
     ]
 
-    study_config["experiment.dataset.precompute_boundary_dist"] = False
+    study_config["experiment.dataset.precompute_boundary_dist"] = True
     study_config["experiment.dataset.boundary_dist_classes"] = None
 
     study_config["model.normalization"] = "none"
-    study_config["model.apply_nonlin"] = "torch.nn.Softmax(dim=1)"
+    study_config["model.apply_nonlin"] = "torch.nn.Softmax(dim=-1)"
+    study_config["performance.compile"] = ENABLE_TORCH_COMPILE
+    study_config["performance.compile.mode"] = TORCH_COMPILE_MODE
+    study_config["performance.compile.backend"] = TORCH_COMPILE_BACKEND
+    study_config["performance.compile.dynamic"] = TORCH_COMPILE_DYNAMIC
+    study_config["performance.compile.fullgraph"] = TORCH_COMPILE_FULLGRAPH
+    study_config["experiment.logging.track_gradient_norm"] = ENABLE_GRAD_NORM_LOGGING
+    study_config["trainer.normalize_gradients"] = None
+    study_config["model.backbone.tbptt_steps"] = BACKBONE_TBPTT_STEPS
 
     # Spike monitoring
     study_config["experiment.logging.spike_watch.enabled"] = True
     study_config["experiment.logging.spike_watch.keys"] = [
         "FocalLoss/loss",
+        "GeneralizedDiceLoss/loss",
         "nnUNetSoftDiceLoss/mask_3",
         "nnUNetSoftDiceLoss/mask_4",
     ]
@@ -293,7 +341,13 @@ def get_study_config():
     study_config["experiment.logging.spike_watch.min_value"] = 0.2
     study_config["experiment.logging.spike_watch.max_images_per_epoch"] = 10
     study_config["experiment.logging.spike_watch.max_images_per_spike"] = 2
-    study_config["experiment.logging.spike_watch.save_classes"] = [1, 2, 3, 4, 5]
+    study_config["experiment.logging.spike_watch.save_classes"] = list(range(1, full_num_classes))
+    study_config["experiment.logging.batch_timing.enabled"] = False
+    study_config["experiment.logging.batch_timing.print_interval"] = 20
+    study_config["experiment.logging.batch_timing.warmup_steps"] = 5
+    study_config["experiment.logging.phase_timing.enabled"] = True
+    study_config["experiment.logging.phase_timing.print_interval"] = 20
+    study_config["experiment.logging.phase_timing.warmup_steps"] = 5
 
     # Optional class subset selection (foreground classes only; background is always class 0)
     selected_classes = SELECTED_CLASSES
@@ -329,12 +383,26 @@ def get_dataset_args(study_config):
         "num_classes": study_config["model.output_channels"],
         "input_size": study_config["experiment.dataset.input_size"],
         "class_subset": study_config.get("experiment.dataset.class_subset", None),
+        "precompute_boundary_dist": study_config.get("experiment.dataset.precompute_boundary_dist", False),
+        "boundary_dist_classes": study_config.get("experiment.dataset.boundary_dist_classes", None),
     }
 
 
 if __name__ == "__main__":
     study_config = get_study_config()
     dataset_args = get_dataset_args(study_config)
+    print(
+        "Runtime config:",
+        {
+            "enabled": study_config.get("performance.compile", False),
+            "mode": study_config.get("performance.compile.mode"),
+            "backend": study_config.get("performance.compile.backend"),
+            "dynamic": study_config.get("performance.compile.dynamic"),
+            "fullgraph": study_config.get("performance.compile.fullgraph"),
+            "track_grad_norm": study_config.get("experiment.logging.track_gradient_norm", False),
+            "tbptt_steps": study_config.get("model.backbone.tbptt_steps", None),
+        },
+    )
 
     study = Study(study_config)
     exp = EXP_OctreeNCA().createExperiment(

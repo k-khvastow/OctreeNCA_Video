@@ -102,7 +102,7 @@ def get_study_config():
     study_config['experiment.dataset.boundary_dist_classes'] = None
 
     study_config['model.normalization'] = "none"
-    study_config['model.apply_nonlin'] = "torch.nn.Softmax(dim=1)"
+    study_config['model.apply_nonlin'] = "torch.nn.Softmax(dim=-1)"
 
     # Spike monitoring (per-batch class counts + save batches on spikes)
     study_config['experiment.logging.spike_watch.enabled'] = True
