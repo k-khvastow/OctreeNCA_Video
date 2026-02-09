@@ -14,6 +14,8 @@ default_config ={
     'performance.num_workers': 8,
     'performance.unlock_CPU': True,
     'performance.inplace_operations': True,
+    'performance.cudnn_benchmark': True,
+    'performance.allow_tf32': True,
 
     'trainer.datagen.batchgenerators': True,
     'trainer.datagen.augmentations': True,

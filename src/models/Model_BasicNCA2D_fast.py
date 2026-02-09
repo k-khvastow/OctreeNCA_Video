@@ -1,4 +1,3 @@
-import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +8,7 @@ except:
  
 class BasicNCA2DFast(nn.Module):
     def __init__(self, channel_n, fire_rate, device, hidden_size=128, input_channels=1, init_method="standard", kernel_size=7, groups=False,
-                 inplace_relu=False, normalization="batch"):
+                 inplace_relu=False, normalization="batch", tbptt_steps=None):
         r"""Init function
             #Args:
                 channel_n: number of channels per cell
@@ -29,6 +28,7 @@ class BasicNCA2DFast(nn.Module):
         self.input_channels = input_channels
 
         self.inplace_relu = inplace_relu
+        self.tbptt_steps = int(tbptt_steps) if tbptt_steps not in (None, 0, "0", "") else None
 
         # One Input
         self.fc0 = nn.Conv2d(channel_n*2, hidden_size, kernel_size=1)
@@ -66,21 +66,19 @@ class BasicNCA2DFast(nn.Module):
         delta_state = torch.cat([state, delta_state], dim=1)
         delta_state = self.fc0(delta_state)
         delta_state = self.bn(delta_state)
-        delta_state = F.relu(delta_state)
+        delta_state = F.relu(delta_state, inplace=self.inplace_relu)
         delta_state = self.fc1(delta_state)
 
         if fire_rate is None:
-            fire_rate=self.fire_rate
+            fire_rate = self.fire_rate
 
         with torch.no_grad():
-            stochastic = torch.zeros([delta_state.size(0),1,delta_state.size(2),
-                                    delta_state.size(3)], device=delta_state.device)
-            #stochastic = torch.zeros([delta_state.size(0),delta_state.size(1),delta_state.size(2),
-            #                        1], device=delta_state.device)
-            stochastic.bernoulli_(p=self.fire_rate).float()
-        delta_state = delta_state * stochastic
+            stochastic = delta_state.new_empty(
+                (delta_state.size(0), 1, delta_state.size(2), delta_state.size(3))
+            )
+            stochastic.bernoulli_(p=fire_rate)
 
-        return state[:, self.input_channels:] + delta_state
+        return state[:, self.input_channels:] + (delta_state * stochastic)
 
     def forward_cuda(self, state: torch.Tensor, steps=10, fire_rate=0.5):
         print("CUDA quick!")
@@ -96,28 +94,52 @@ class BasicNCA2DFast(nn.Module):
             state = new_state
         return state
 
-    def forward(self, x, steps=10, fire_rate=0.5):
+    def _forward_bchw(self, state: torch.Tensor, steps=10, fire_rate=0.5, visualize: bool = False):
+        if not self.training and self.use_forward_cuda and not visualize:
+            return self.forward_cuda(state, steps, fire_rate)
+
+        const_inputs = state[:, 0:self.input_channels]
+        gallery = [] if visualize else None
+        for step in range(steps):
+            new_state = self.update(state, fire_rate)
+            state = torch.cat([const_inputs, new_state], dim=1)
+            if visualize:
+                gallery.append(state.permute(0, 2, 3, 1).detach().cpu())
+            if (
+                self.training
+                and self.tbptt_steps is not None
+                and self.tbptt_steps > 0
+                and ((step + 1) % self.tbptt_steps == 0)
+                and ((step + 1) < steps)
+            ):
+                # Truncated BPTT: keeps optimization stable while shortening autograd history.
+                state = state.detach()
+
+        if visualize:
+            return state, gallery
+        return state
+
+    def forward(self, x, steps=10, fire_rate=0.5, input_layout: str = "BHWC", visualize: bool = False):
         r"""Forward function applies update function s times leaving input channels unchanged
             #Args:
                 x: image
                 steps: number of steps to run update
                 fire_rate: random activation rate of each cell
         """
-        #x: BHWC
-        state = einops.rearrange(x, "b h w c -> b c h w")
-        #x: BCHW
+        if input_layout == "BHWC":
+            state = x.permute(0, 3, 1, 2).contiguous()
+            state = self._forward_bchw(state, steps, fire_rate, visualize=visualize)
+            if visualize:
+                state, gallery = state
+                return state.permute(0, 2, 3, 1), gallery
+            return state.permute(0, 2, 3, 1)
 
-        if not self.training and self.use_forward_cuda:
-            state = self.forward_cuda(state, steps, fire_rate)
-            return einops.rearrange(state, "b c h w -> b h w c")
-        
+        if input_layout == "BCHW":
+            state = x.contiguous()
+            state = self._forward_bchw(state, steps, fire_rate, visualize=visualize)
+            if visualize:
+                return state
+            return state
 
-        const_inputs = state[:,0:self.input_channels]
-
-        for step in range(steps):
-            new_state = self.update(state, fire_rate)
-            state = torch.cat([const_inputs, new_state], dim=1)
-
-        return einops.rearrange(state, "b c h w -> b h w c")
+        raise ValueError(f"Unknown input_layout {input_layout}. Expected 'BHWC' or 'BCHW'.")
     
-

@@ -60,7 +60,7 @@ class OctreeNCA2DWarmStartM1Init(nn.Module):
             self.m1.eval()
         return self
 
-    def init_state_from_m1(self, x: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _forward_m1(self, x: torch.Tensor, y: Optional[torch.Tensor] = None) -> dict:
         # x: BCHW, y: BCHW
         if y is None:
             y = torch.zeros(
@@ -74,7 +74,11 @@ class OctreeNCA2DWarmStartM1Init(nn.Module):
                 out = self.m1(x, y)
         else:
             out = self.m1(x, y)
+        return out
 
+    def _state_from_m1_output(self, x: torch.Tensor, out: dict) -> torch.Tensor:
+        # x: BCHW
+        # out logits/hidden are BHWC
         logits = out['logits']
         hidden = out.get('hidden_channels', None)
         if hidden is None:
@@ -109,6 +113,26 @@ class OctreeNCA2DWarmStartM1Init(nn.Module):
         state[..., self.input_channels:self.input_channels + self.output_channels] = prev_out
         state[..., self.input_channels + self.output_channels:] = hidden
         return state
+
+    def m1_forward(self, x: torch.Tensor, y: Optional[torch.Tensor] = None) -> dict:
+        return self._forward_m1(x, y)
+
+    def init_state_from_m1(
+        self,
+        x: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        m1_out: Optional[dict] = None,
+    ) -> torch.Tensor:
+        if m1_out is None:
+            m1_out = self._forward_m1(x, y)
+        return self._state_from_m1_output(x, m1_out)
+
+    def m1_forward_and_init_state(
+        self, x: torch.Tensor, y: Optional[torch.Tensor] = None
+    ):
+        m1_out = self._forward_m1(x, y)
+        state = self._state_from_m1_output(x, m1_out)
+        return m1_out, state
 
     def forward(
         self,
