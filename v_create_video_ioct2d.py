@@ -154,7 +154,7 @@ def create_video_ioct2d(
 
     # 4. Initialize Video Writer
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"ioct2d_{random_word}_{target_patient_id}.mp4")
+    out_path = os.path.join(output_dir, f"long_ioct2d_{random_word}_{target_patient_id}.mp4")
     video_writer = None
 
     print("Generating video frames...")
