@@ -167,28 +167,49 @@ class FocalLoss(torch.nn.Module):
         self.ignore_index = ignore_index
         self.reduction = reduction
 
-    def forward(self, input: torch.Tensor = None, target: torch.Tensor = None, logits=None, x=None, y=None, **kwargs) -> torch.Tensor:
-        # Support common wrapper kwargs: logits/target or x/y.
+    def forward(self, input: torch.Tensor = None, target: torch.Tensor = None, logits=None, x=None, y=None,
+                logits_cf=None, target_cf=None, target_idx=None, **kwargs) -> torch.Tensor:
+        # Support common wrapper kwargs: logits/target or x/y plus precomputed channels-first tensors.
         if input is None:
-            input = logits if logits is not None else x
+            input = logits_cf if logits_cf is not None else (logits if logits is not None else x)
+        input = _to_channels_first(input)
+
         if target is None:
-            target = y
+            if target_idx is not None:
+                target = target_idx
+            elif target_cf is not None:
+                target = target_cf
+            else:
+                target = y
 
-        # input: [B, C, H, W], target: [B, H, W] (class indices) or one-hot [B, C, H, W]
-        if target.dtype in (torch.float16, torch.float32) and target.dim() == 4:
-            target = torch.argmax(target, dim=1)
+        # target can be class indices [B, H, W] / [B, H, W, D] or one-hot with same dim as input.
+        if target.dim() == input.dim():
+            # One-hot target in either channels-first or channels-last form.
+            if target.shape[1] == input.shape[1]:
+                target = torch.argmax(target, dim=1)
+            elif target.shape[-1] == input.shape[1]:
+                target = torch.argmax(target, dim=-1)
+            elif target.shape[1] == 1:
+                target = target[:, 0]
+            elif target.shape[-1] == 1:
+                target = target[..., 0]
+            else:
+                raise ValueError(
+                    f"Could not infer class dimension for target shape {tuple(target.shape)} "
+                    f"with input shape {tuple(input.shape)}."
+                )
 
-        log_probs = F.log_softmax(input, dim=1)  # [B, C, H, W]
+        target = target.long()
+        log_probs = F.log_softmax(input, dim=1)  # channels-first
         probs = log_probs.exp()
 
-        # gather p_t and log_p_t
-        target = target.unsqueeze(1)  # [B, 1, H, W]
-        log_p_t = log_probs.gather(1, target).squeeze(1)  # [B, H, W]
-        p_t = probs.gather(1, target).squeeze(1)
+        target_unsqueezed = target.unsqueeze(1)
+        log_p_t = log_probs.gather(1, target_unsqueezed).squeeze(1)
+        p_t = probs.gather(1, target_unsqueezed).squeeze(1)
 
         # mask ignore_index
         if self.ignore_index is not None:
-            valid = (target.squeeze(1) != self.ignore_index)
+            valid = (target != self.ignore_index)
             log_p_t = log_p_t[valid]
             p_t = p_t[valid]
         else:
@@ -201,8 +222,7 @@ class FocalLoss(torch.nn.Module):
                 alpha = torch.tensor(self.alpha, device=input.device, dtype=input.dtype)
             else:
                 alpha = self.alpha.to(input.device, input.dtype)
-            # alpha per pixel based on target class
-            alpha_t = alpha.gather(0, target.squeeze(1).clamp_min(0))
+            alpha_t = alpha.gather(0, target.clamp_min(0))
             if valid is not None:
                 alpha_t = alpha_t[valid]
             focal = focal * alpha_t

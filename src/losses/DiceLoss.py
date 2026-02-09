@@ -194,11 +194,11 @@ class GeneralizedDiceLoss(torch.nn.Module):
                 return einops.rearrange(tensor, "b h w d c -> b c h w d")
         return tensor
 
-    def forward(self, x=None, y=None, loss_mask=None, logits=None, target=None, **kwargs):
+    def forward(self, x=None, y=None, loss_mask=None, logits=None, target=None, logits_cf=None, target_cf=None, **kwargs):
         if x is None:
-            x = logits
+            x = logits_cf if logits_cf is not None else logits
         if y is None:
-            y = target
+            y = target_cf if target_cf is not None else target
         if x is None or y is None:
             raise ValueError("GeneralizedDiceLoss requires logits/x and target/y.")
 
@@ -256,7 +256,9 @@ class BoundaryLoss(torch.nn.Module):
                  dist_map_power: float = 1.0,
                  dist_clip: float = None,
                  use_precomputed: bool = True,
-                 use_probabilities: bool = False):
+                 use_probabilities: bool = False,
+                 compute_missing_dist: bool = True,
+                 warn_if_missing_precomputed: bool = True):
         super().__init__()
         self.idc = idc
         self.do_bg = do_bg
@@ -265,6 +267,9 @@ class BoundaryLoss(torch.nn.Module):
         self.dist_clip = dist_clip
         self.use_precomputed = use_precomputed
         self.use_probabilities = use_probabilities
+        self.compute_missing_dist = compute_missing_dist
+        self.warn_if_missing_precomputed = warn_if_missing_precomputed
+        self._warned_missing_precomputed = False
 
     def _to_bchw(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.dim() != 4:
@@ -280,21 +285,28 @@ class BoundaryLoss(torch.nn.Module):
             return list(range(1, num_classes))
         return None
 
-    def forward(self, logits=None, target=None, probabilities=None, target_dist=None, **kwargs):
+    def forward(self, logits=None, target=None, probabilities=None, target_dist=None,
+                logits_cf=None, target_cf=None, probabilities_cf=None, target_dist_cf=None, **kwargs):
         if self.use_probabilities and probabilities is not None:
-            probs = probabilities
+            probs = probabilities_cf if probabilities_cf is not None else probabilities
+            probs = self._to_bchw(probs)
         elif probabilities is None or not self.use_probabilities:
-            if logits is None:
-                raise ValueError("BoundaryLoss requires logits or probabilities.")
-            probs = F.softmax(logits, dim=-1 if self.channel_last else 1)
+            if logits_cf is not None:
+                probs = F.softmax(logits_cf, dim=1)
+            else:
+                if logits is None:
+                    raise ValueError("BoundaryLoss requires logits or probabilities.")
+                probs = F.softmax(logits, dim=-1 if self.channel_last else 1)
+                probs = self._to_bchw(probs)
 
-        probs = self._to_bchw(probs)
         num_classes = probs.shape[1]
 
         if target is None:
             raise ValueError("BoundaryLoss requires target.")
 
-        if target.dim() == 3:
+        if target_cf is not None:
+            target = target_cf.float()
+        elif target.dim() == 3:
             target = F.one_hot(target.long(), num_classes=num_classes).float()
             target = target.permute(0, 3, 1, 2)
         else:
@@ -308,9 +320,9 @@ class BoundaryLoss(torch.nn.Module):
             probs = probs[:, class_ids]
 
         dist = None
-        if target_dist is not None and self.use_precomputed:
-            dist = target_dist
-            if dist.dim() == 4 and self.channel_last:
+        if self.use_precomputed and (target_dist_cf is not None or target_dist is not None):
+            dist = target_dist_cf if target_dist_cf is not None else target_dist
+            if dist.dim() == 4 and dist.shape[-1] < dist.shape[1]:
                 dist = dist.permute(0, 3, 1, 2)
             if class_ids is not None and dist.shape[1] != len(class_ids):
                 dist = dist[:, class_ids]
@@ -319,6 +331,16 @@ class BoundaryLoss(torch.nn.Module):
                 dist = None
 
         if dist is None:
+            if self.use_precomputed and not self.compute_missing_dist:
+                if self.warn_if_missing_precomputed and not self._warned_missing_precomputed:
+                    print(
+                        "[BoundaryLoss] target_dist missing while use_precomputed=True. "
+                        "Skipping BoundaryLoss for this batch. "
+                        "Provide `target_dist` (preferred) or set compute_missing_dist=True."
+                    )
+                    self._warned_missing_precomputed = True
+                zero = torch.zeros(1, device=probs.device, dtype=probs.dtype).mean()
+                return zero, {"loss": 0.0}
             with torch.no_grad():
                 target_np = target.detach().cpu().numpy()
                 dist_np = batch_signed_distance_map(

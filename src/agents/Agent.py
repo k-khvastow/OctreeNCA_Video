@@ -19,6 +19,7 @@ import torchio as tio
 from src.utils.ProjectConfiguration import ProjectConfiguration as pc
 from src.utils.vitca_utils import norm_grad
 import datetime
+import time
 from collections import deque
 
 class BaseAgent():
@@ -56,6 +57,16 @@ class BaseAgent():
         """
         self.device = torch.device(self.exp.get_from_config('experiment.device'))
         self.batch_size = self.exp.get_from_config('trainer.batch_size')
+
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            # Use cuDNN autotune for fixed-size conv workloads and allow TF32 on Ampere+.
+            torch.backends.cudnn.benchmark = bool(self._get_config('performance.cudnn_benchmark', True))
+            allow_tf32 = bool(self._get_config('performance.allow_tf32', True))
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+            torch.backends.cudnn.allow_tf32 = allow_tf32
+            if allow_tf32:
+                torch.set_float32_matmul_precision('high')
+
         # If stacked NCAs
         if isinstance(self.model, list):
             self.optimizer = []
@@ -79,8 +90,9 @@ class BaseAgent():
             self.ema: EMA = EMA(self.model, self.exp.config['trainer.ema.decay'])
             assert self.exp.config['trainer.ema.update_per'] in ['batch', 'epoch']
 
+        self._use_amp = bool(self.exp.config.get('trainer.use_amp', False)) and (self.device.type == "cuda") and torch.cuda.is_available()
         if self.exp.config.get('trainer.use_amp', False):
-             self.scaler = torch.amp.GradScaler('cuda')
+            self.scaler = torch.amp.GradScaler('cuda', enabled=self._use_amp)
         self._init_spike_watch()
 
     def _get_config(self, key: str, default=None):
@@ -148,10 +160,10 @@ class BaseAgent():
             return
 
         with torch.no_grad():
-            logits = out.get('logits', None)
-            if logits is None:
-                logits = out.get('probabilities', None)
-            if logits is None:
+            pred_scores = out.get('probabilities', None)
+            if pred_scores is None:
+                pred_scores = out.get('logits', None)
+            if pred_scores is None:
                 return
 
             # logits: BHWC, labels: BCHW
@@ -169,14 +181,26 @@ class BaseAgent():
                 return
 
             gt_bhwc = labels.permute(0, 2, 3, 1)
-            pred_bhwc = logits
+            pred_bhwc = pred_scores
+            # Some models may expose predictions as BCHW.
+            if pred_bhwc.dim() == 4 and pred_bhwc.shape[1] == gt_bhwc.shape[-1]:
+                pred_bhwc = pred_bhwc.permute(0, 2, 3, 1)
 
-            class_idx = [c for c in self._spike_watch_save_classes if c < pred_bhwc.shape[-1]]
+            if pred_bhwc.dim() != 4 or pred_bhwc.shape[-1] != gt_bhwc.shape[-1]:
+                return
+
+            num_classes = pred_bhwc.shape[-1]
+            class_idx = [c for c in self._spike_watch_save_classes if 0 <= c < num_classes]
             if len(class_idx) == 0:
                 return
 
-            pred_sel = pred_bhwc[..., class_idx]
-            gt_sel = gt_bhwc[..., class_idx]
+            # Decode with argmax across all classes (including background 0), then
+            # re-encode only requested classes for visualization.
+            pred_cls = pred_bhwc.argmax(dim=-1)
+            gt_cls = gt_bhwc.argmax(dim=-1)
+
+            pred_sel = torch.stack([(pred_cls == c) for c in class_idx], dim=-1)
+            gt_sel = torch.stack([(gt_cls == c) for c in class_idx], dim=-1)
 
             is_rgb = False
             try:
@@ -243,11 +267,39 @@ class BaseAgent():
             #Returns:
                 loss item
         """
+        phase_timing_enabled = getattr(self, '_phase_timing_enabled', False)
+        phase_timing_cuda = getattr(self, '_phase_timing_cuda', False)
+        phase_times = {
+            "prepare_data_s": 0.0,
+            "forward_s": 0.0,
+            "loss_s": 0.0,
+            "backward_s": 0.0,
+            "optimizer_step_s": 0.0,
+        }
+        use_amp = bool(getattr(self, "_use_amp", False))
+
+        if phase_timing_enabled:
+            t_prepare = time.perf_counter()
         data = self.prepare_data(data)
+        if phase_timing_enabled:
+            phase_times["prepare_data_s"] = time.perf_counter() - t_prepare
         # data["image"]: BCHW
         # data["label"]: BCHW
-        out = self.get_outputs(data)
-        self.optimizer.zero_grad()
+
+        if phase_timing_enabled:
+            if phase_timing_cuda:
+                torch.cuda.synchronize(self.device)
+            t_forward = time.perf_counter()
+        if use_amp:
+            with torch.amp.autocast(device_type='cuda'):
+                out = self.get_outputs(data)
+        else:
+            out = self.get_outputs(data)
+        if phase_timing_enabled:
+            if phase_timing_cuda:
+                torch.cuda.synchronize(self.device)
+            phase_times["forward_s"] = time.perf_counter() - t_forward
+        self.optimizer.zero_grad(set_to_none=True)
         loss = 0
         loss_ret = {}
         #print(outputs.shape, targets.shape)
@@ -255,12 +307,20 @@ class BaseAgent():
         out["target_unpatched"] = data["label"]
         if "label_dist" in data:
             out["target_dist"] = data["label_dist"]
-        if self.exp.config.get('trainer.use_amp', False):
-            # Using AMP
-            with torch.amp.autocast('cuda'):
+
+        if phase_timing_enabled:
+            if phase_timing_cuda:
+                torch.cuda.synchronize(self.device)
+            t_loss = time.perf_counter()
+        if use_amp:
+            with torch.amp.autocast(device_type='cuda'):
                 loss, loss_ret = loss_f(**out)
         else:
             loss, loss_ret = loss_f(**out)
+        if phase_timing_enabled:
+            if phase_timing_cuda:
+                torch.cuda.synchronize(self.device)
+            phase_times["loss_s"] = time.perf_counter() - t_loss
 
         self._log_batch_class_counts(data, loss_ret)
         self._maybe_log_spike_batch(data, out, loss_ret)
@@ -277,13 +337,21 @@ class BaseAgent():
             do_backward = True
 
         if do_backward:
-            if self.exp.config.get('trainer.use_amp', False):
+            if phase_timing_enabled:
+                if phase_timing_cuda:
+                    torch.cuda.synchronize(self.device)
+                t_backward = time.perf_counter()
+            if use_amp:
                 self.scaler.scale(loss).backward()
                 if self.exp.config['trainer.normalize_gradients'] == "all" or self.exp.config['experiment.logging.track_gradient_norm']:
-                     self.scaler.unscale_(self.optimizer)
-                     # ... unscaling happens
+                    self.scaler.unscale_(self.optimizer)
+                    # ... unscaling happens
             else:
                 loss.backward()
+            if phase_timing_enabled:
+                if phase_timing_cuda:
+                    torch.cuda.synchronize(self.device)
+                phase_times["backward_s"] = time.perf_counter() - t_backward
 
             if self.exp.config['trainer.normalize_gradients'] == "all" or self.exp.config['experiment.logging.track_gradient_norm']:
                 total_norm = 0
@@ -312,7 +380,11 @@ class BaseAgent():
                     self.epoch_grad_norm = []
                 self.epoch_grad_norm.append(total_norm)
 
-            if self.exp.config.get('trainer.use_amp', False):
+            if phase_timing_enabled:
+                if phase_timing_cuda:
+                    torch.cuda.synchronize(self.device)
+                t_optimizer_step = time.perf_counter()
+            if use_amp:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -322,6 +394,54 @@ class BaseAgent():
             
             if self.exp.config['trainer.ema'] and self.exp.config['trainer.ema.update_per'] == 'batch':
                 self.ema.update()
+            if phase_timing_enabled:
+                if phase_timing_cuda:
+                    torch.cuda.synchronize(self.device)
+                phase_times["optimizer_step_s"] = time.perf_counter() - t_optimizer_step
+
+        if phase_timing_enabled:
+            global_step = self._current_global_step
+            if global_step is not None:
+                self.exp.write_scalar('TimingPhases/train_step/prepare_data_ms', phase_times["prepare_data_s"] * 1000.0, global_step)
+                self.exp.write_scalar('TimingPhases/train_step/forward_ms', phase_times["forward_s"] * 1000.0, global_step)
+                self.exp.write_scalar('TimingPhases/train_step/loss_ms', phase_times["loss_s"] * 1000.0, global_step)
+                self.exp.write_scalar('TimingPhases/train_step/backward_ms', phase_times["backward_s"] * 1000.0, global_step)
+                self.exp.write_scalar('TimingPhases/train_step/optimizer_step_ms', phase_times["optimizer_step_s"] * 1000.0, global_step)
+                phase_total_s = sum(phase_times.values())
+                self.exp.write_scalar('TimingPhases/train_step/total_ms', phase_total_s * 1000.0, global_step)
+
+            batch_index = self._current_batch_index if self._current_batch_index is not None else -1
+            if batch_index >= self._phase_timing_warmup_steps:
+                self._phase_timing_epoch_count += 1
+                for k, v in phase_times.items():
+                    self._phase_timing_epoch_sums[k] += v
+
+            if batch_index >= 0 and batch_index % self._phase_timing_print_interval == 0:
+                if self._phase_timing_epoch_count > 0:
+                    avg_prepare = self._phase_timing_epoch_sums["prepare_data_s"] / self._phase_timing_epoch_count
+                    avg_forward = self._phase_timing_epoch_sums["forward_s"] / self._phase_timing_epoch_count
+                    avg_loss = self._phase_timing_epoch_sums["loss_s"] / self._phase_timing_epoch_count
+                    avg_backward = self._phase_timing_epoch_sums["backward_s"] / self._phase_timing_epoch_count
+                    avg_optimizer_step = self._phase_timing_epoch_sums["optimizer_step_s"] / self._phase_timing_epoch_count
+                else:
+                    avg_prepare = phase_times["prepare_data_s"]
+                    avg_forward = phase_times["forward_s"]
+                    avg_loss = phase_times["loss_s"]
+                    avg_backward = phase_times["backward_s"]
+                    avg_optimizer_step = phase_times["optimizer_step_s"]
+                print(
+                    f"[phase_timing] epoch={self._current_epoch} step={batch_index} "
+                    f"prepare={phase_times['prepare_data_s']*1000.0:.1f}ms "
+                    f"fwd={phase_times['forward_s']*1000.0:.1f}ms "
+                    f"loss={phase_times['loss_s']*1000.0:.1f}ms "
+                    f"bwd={phase_times['backward_s']*1000.0:.1f}ms "
+                    f"opt={phase_times['optimizer_step_s']*1000.0:.1f}ms | "
+                    f"avg_prepare={avg_prepare*1000.0:.1f}ms "
+                    f"avg_fwd={avg_forward*1000.0:.1f}ms "
+                    f"avg_loss={avg_loss*1000.0:.1f}ms "
+                    f"avg_bwd={avg_backward*1000.0:.1f}ms "
+                    f"avg_opt={avg_optimizer_step*1000.0:.1f}ms"
+                )
 
         return loss_ret
 
@@ -506,6 +626,17 @@ class BaseAgent():
             #Args
                 dataloader (Dataloader): contains training data
                 loss_f (nn.Model): The loss for training"""
+        timing_enabled = bool(self._get_config('experiment.logging.batch_timing.enabled', False))
+        timing_print_interval = int(self._get_config('experiment.logging.batch_timing.print_interval', 20))
+        timing_warmup_steps = int(self._get_config('experiment.logging.batch_timing.warmup_steps', 5))
+        timing_print_interval = max(1, timing_print_interval)
+        timing_warmup_steps = max(0, timing_warmup_steps)
+        cuda_timing = (self.device.type == "cuda") and torch.cuda.is_available()
+        self._phase_timing_enabled = bool(self._get_config('experiment.logging.phase_timing.enabled', False))
+        self._phase_timing_print_interval = max(1, int(self._get_config('experiment.logging.phase_timing.print_interval', 20)))
+        self._phase_timing_warmup_steps = max(0, int(self._get_config('experiment.logging.phase_timing.warmup_steps', 5)))
+        self._phase_timing_cuda = (self.device.type == "cuda") and torch.cuda.is_available()
+
         for epoch in range(self.exp.currentStep, self.exp.get_max_steps()+1):
             torch.cuda.reset_peak_memory_stats(self.device)
             print(f"{datetime.datetime.now().strftime('%I:%M%p, %B %d, %Y')} Epoch: {epoch}")
@@ -517,12 +648,72 @@ class BaseAgent():
                 self._spike_watch_epoch_count = 0
             self.initialize_epoch()
             print('Dataset size: ' + str(len(dataloader)))
+            if self._phase_timing_enabled:
+                self._phase_timing_epoch_count = 0
+                self._phase_timing_epoch_sums = {
+                    "prepare_data_s": 0.0,
+                    "forward_s": 0.0,
+                    "loss_s": 0.0,
+                    "backward_s": 0.0,
+                    "optimizer_step_s": 0.0,
+                }
+
+            if timing_enabled:
+                timing_wait_sum = 0.0
+                timing_compute_sum = 0.0
+                timing_iter_sum = 0.0
+                timing_count = 0
+                iter_end = time.perf_counter()
+
             for i, data in enumerate(tqdm(dataloader)):
+                if timing_enabled:
+                    data_wait_s = time.perf_counter() - iter_end
+                    if cuda_timing:
+                        torch.cuda.synchronize(self.device)
+                    compute_start = time.perf_counter()
+
                 self._current_global_step = (epoch * len(dataloader)) + i
                 self._current_epoch = epoch
                 self._current_batch_index = i
                 loss_item = self.batch_step(data, loss_f)
-                
+
+                if timing_enabled:
+                    if cuda_timing:
+                        torch.cuda.synchronize(self.device)
+                    compute_s = time.perf_counter() - compute_start
+                    iter_s = data_wait_s + compute_s
+                    wait_ratio = data_wait_s / max(iter_s, 1e-12)
+                    global_step = self._current_global_step
+                    self.exp.write_scalar('Timing/train_step/data_wait_ms', data_wait_s * 1000.0, global_step)
+                    self.exp.write_scalar('Timing/train_step/compute_ms', compute_s * 1000.0, global_step)
+                    self.exp.write_scalar('Timing/train_step/iter_ms', iter_s * 1000.0, global_step)
+                    self.exp.write_scalar('Timing/train_step/wait_ratio', wait_ratio, global_step)
+
+                    if i >= timing_warmup_steps:
+                        timing_wait_sum += data_wait_s
+                        timing_compute_sum += compute_s
+                        timing_iter_sum += iter_s
+                        timing_count += 1
+
+                    if i % timing_print_interval == 0:
+                        if timing_count > 0:
+                            avg_wait_s = timing_wait_sum / timing_count
+                            avg_compute_s = timing_compute_sum / timing_count
+                            avg_iter_s = timing_iter_sum / timing_count
+                            avg_wait_ratio = avg_wait_s / max(avg_iter_s, 1e-12)
+                        else:
+                            avg_wait_s = data_wait_s
+                            avg_compute_s = compute_s
+                            avg_iter_s = iter_s
+                            avg_wait_ratio = wait_ratio
+                        print(
+                            f"[timing] epoch={epoch} step={i} "
+                            f"wait={data_wait_s*1000.0:.1f}ms compute={compute_s*1000.0:.1f}ms "
+                            f"wait_ratio={wait_ratio:.2f} | "
+                            f"avg_wait={avg_wait_s*1000.0:.1f}ms avg_compute={avg_compute_s*1000.0:.1f}ms "
+                            f"avg_wait_ratio={avg_wait_ratio:.2f}"
+                        )
+
                 # Step-wise logging
                 global_step = self._current_global_step
                 for key, value in loss_item.items():
@@ -544,6 +735,44 @@ class BaseAgent():
                         loss_log[key].append(loss_item[key])
                     else:
                         loss_log[key].append(loss_item[key].detach())
+
+                if timing_enabled:
+                    iter_end = time.perf_counter()
+
+            if timing_enabled and timing_count > 0:
+                epoch_avg_wait_s = timing_wait_sum / timing_count
+                epoch_avg_compute_s = timing_compute_sum / timing_count
+                epoch_avg_iter_s = timing_iter_sum / timing_count
+                epoch_avg_wait_ratio = epoch_avg_wait_s / max(epoch_avg_iter_s, 1e-12)
+                self.exp.write_scalar('Timing/train_epoch/avg_data_wait_ms', epoch_avg_wait_s * 1000.0, epoch)
+                self.exp.write_scalar('Timing/train_epoch/avg_compute_ms', epoch_avg_compute_s * 1000.0, epoch)
+                self.exp.write_scalar('Timing/train_epoch/avg_iter_ms', epoch_avg_iter_s * 1000.0, epoch)
+                self.exp.write_scalar('Timing/train_epoch/avg_wait_ratio', epoch_avg_wait_ratio, epoch)
+                print(
+                    f"[timing][epoch={epoch}] "
+                    f"avg_wait={epoch_avg_wait_s*1000.0:.1f}ms "
+                    f"avg_compute={epoch_avg_compute_s*1000.0:.1f}ms "
+                    f"avg_wait_ratio={epoch_avg_wait_ratio:.2f}"
+                )
+            if self._phase_timing_enabled and self._phase_timing_epoch_count > 0:
+                epoch_avg_prepare_s = self._phase_timing_epoch_sums["prepare_data_s"] / self._phase_timing_epoch_count
+                epoch_avg_forward_s = self._phase_timing_epoch_sums["forward_s"] / self._phase_timing_epoch_count
+                epoch_avg_loss_s = self._phase_timing_epoch_sums["loss_s"] / self._phase_timing_epoch_count
+                epoch_avg_backward_s = self._phase_timing_epoch_sums["backward_s"] / self._phase_timing_epoch_count
+                epoch_avg_optimizer_step_s = self._phase_timing_epoch_sums["optimizer_step_s"] / self._phase_timing_epoch_count
+                self.exp.write_scalar('TimingPhases/train_epoch/avg_prepare_data_ms', epoch_avg_prepare_s * 1000.0, epoch)
+                self.exp.write_scalar('TimingPhases/train_epoch/avg_forward_ms', epoch_avg_forward_s * 1000.0, epoch)
+                self.exp.write_scalar('TimingPhases/train_epoch/avg_loss_ms', epoch_avg_loss_s * 1000.0, epoch)
+                self.exp.write_scalar('TimingPhases/train_epoch/avg_backward_ms', epoch_avg_backward_s * 1000.0, epoch)
+                self.exp.write_scalar('TimingPhases/train_epoch/avg_optimizer_step_ms', epoch_avg_optimizer_step_s * 1000.0, epoch)
+                print(
+                    f"[phase_timing][epoch={epoch}] "
+                    f"avg_prepare={epoch_avg_prepare_s*1000.0:.1f}ms "
+                    f"avg_fwd={epoch_avg_forward_s*1000.0:.1f}ms "
+                    f"avg_loss={epoch_avg_loss_s*1000.0:.1f}ms "
+                    f"avg_bwd={epoch_avg_backward_s*1000.0:.1f}ms "
+                    f"avg_opt={epoch_avg_optimizer_step_s*1000.0:.1f}ms"
+                )
 
             if epoch == 2:
                 print("measure memory allocation")
