@@ -20,10 +20,25 @@ DATA_ROOT = "/vol/data/OctreeNCA_Video/ioct_data"
 SELECTED_CLASSES = None  # e.g. [1, 2]
 
 # Set this to your M1 checkpoint (.pth) or directory containing model.pth.
-M1_CHECKPOINT_PATH = "/vol/data/OctreeNCA_Video/<path>/<path>/octree_study_new/Experiments/iOCT2D_preparation_24_Training OctreeNCA on iOCT 2D frames./models/epoch_99/model.pth"
+M1_CHECKPOINT_PATH = "/vol/data/OctreeNCA_Video/<path>/<path>/octree_study_new/Experiments/iOCT2D_pan_24_Training OctreeNCA on iOCT 2D frames./models/epoch_99/model.pth"
 
 SEQUENCE_LENGTH = 2
-SEQUENCE_STEP = 1
+SEQUENCE_STEP = 10
+INIT_M2_FROM_M1 = os.getenv("IOCT_WARM_INIT_M2_FROM_M1", "0") == "1"
+SHARE_M1_M2_BACKBONE = os.getenv("IOCT_WARM_SHARE_M1_M2_BACKBONE", "0") == "1"
+_seq_tbptt_env = os.getenv("IOCT_WARM_SEQ_TBPTT_STEPS", os.getenv("IOCT_SEQ_TBPTT_STEPS", "")).strip()
+SEQUENCE_TBPTT_STEPS = int(_seq_tbptt_env) if _seq_tbptt_env else None
+
+WARM_MULTISCALE = os.getenv("IOCT_WARM_MULTISCALE", "0") == "1"
+WARM_MULTISCALE_START_LEVEL = os.getenv("IOCT_WARM_MULTISCALE_START_LEVEL", "").strip()
+WARM_MULTISCALE_STEPS = os.getenv("IOCT_WARM_MULTISCALE_STEPS", "").strip()
+WARM_MULTISCALE_DOWNSAMPLE_MODE = os.getenv("IOCT_WARM_MULTISCALE_DOWNSAMPLE_MODE", "nearest").strip()
+WARM_LOGITS_MODE = os.getenv("IOCT_WARM_LOGITS_MODE", "carry").strip().lower()
+WARM_LOGITS_GATE_FROM = os.getenv("IOCT_WARM_LOGITS_GATE_FROM", "hidden").strip().lower()
+WARM_HIDDEN_NORM = os.getenv("IOCT_WARM_HIDDEN_NORM", "none").strip().lower()
+WARM_HIDDEN_CLIP = os.getenv("IOCT_WARM_HIDDEN_CLIP", "").strip()
+WARM_HIDDEN_TANH_SCALE = os.getenv("IOCT_WARM_HIDDEN_TANH_SCALE", "").strip()
+WARM_HIDDEN_GN_GROUPS = os.getenv("IOCT_WARM_HIDDEN_GN_GROUPS", "").strip()
 
 DATASETS = ["peeling", "sri"]
 VIEWS = ["A", "B"]
@@ -37,6 +52,12 @@ TORCH_COMPILE_FULLGRAPH = os.getenv("IOCT_WARM_TORCH_COMPILE_FULLGRAPH", os.gete
 ENABLE_GRAD_NORM_LOGGING = os.getenv("IOCT_WARM_TRACK_GRAD_NORM", os.getenv("IOCT_TRACK_GRAD_NORM", "0")) == "1"
 _tbptt_env = os.getenv("IOCT_WARM_TBPTT_STEPS", os.getenv("IOCT_TBPTT_STEPS", "")).strip()
 BACKBONE_TBPTT_STEPS = int(_tbptt_env) if _tbptt_env else None
+LR_OVERRIDE = os.getenv("IOCT_WARM_LR", "").strip()
+LR_SCALE = float(os.getenv("IOCT_WARM_LR_SCALE", "1.0"))
+RESUME_EXPERIMENT_NAME = os.getenv("IOCT_WARM_RESUME_EXPERIMENT_NAME", "").strip()
+RESUME_MODEL_PATH = os.getenv("IOCT_WARM_RESUME_MODEL_PATH", "").strip()
+
+
 
 r = wonderwords.RandomWord()
 random_word = r.word(include_parts_of_speech=["nouns"])
@@ -313,13 +334,13 @@ def get_study_config():
     study_config["model.backbone_class"] = "BasicNCA2DFast"
     study_config["model.octree.separate_models"] = True
     study_config["model.octree.res_and_steps"] = _build_octree_resolutions(
-        input_size, steps, int(alpha * 20 / 2)
+        input_size, steps, int(alpha * 20)
     )
-    study_config["model.kernel_size"] = [5] * len(study_config["model.octree.res_and_steps"])
-    study_config["model.octree.warm_start_steps"] = 20
+    study_config["model.kernel_size"] = [3] * len(study_config["model.octree.res_and_steps"])
+    study_config["model.octree.warm_start_steps"] = 10
     study_config["model.channel_n"] = 24
-    study_config["model.hidden_size"] = 32
-    study_config["trainer.batch_size"] = 1
+    study_config["model.hidden_size"] = 64
+    study_config["trainer.batch_size"] = 4
     study_config["trainer.gradient_accumulation"] = 8
     study_config["trainer.normalize_gradients"] = "all"
 
@@ -329,6 +350,49 @@ def get_study_config():
     study_config["model.m1.use_first_frame"] = True
     study_config["model.m1.use_t0_for_loss"] = False
     study_config["model.m1.use_probs"] = False
+    # M2 init / weight sharing options
+    # - Set IOCT_WARM_INIT_M2_FROM_M1=1 to copy M1 backbone weights into M2 at init time.
+    # - Set IOCT_WARM_SHARE_M1_M2_BACKBONE=1 to share the same backbone modules (requires model.m1.freeze=0 and model.m1.eval_mode=0).
+    study_config["model.m2.init_from_m1"] = INIT_M2_FROM_M1
+    study_config["model.m2.share_backbone_with_m1"] = SHARE_M1_M2_BACKBONE
+    study_config["model.sequence.tbptt_steps"] = SEQUENCE_TBPTT_STEPS
+
+    # Multi-scale warm-start refinement across octree levels (coarse -> fine).
+    # Enable with IOCT_WARM_MULTISCALE=1.
+    # Optional:
+    # - IOCT_WARM_MULTISCALE_START_LEVEL: integer level index to start from (default: coarsest).
+    # - IOCT_WARM_MULTISCALE_STEPS: int (all levels) or comma list of length n_levels (level0..levelN).
+    # - IOCT_WARM_MULTISCALE_DOWNSAMPLE_MODE: nearest|bilinear|bicubic|area for downsampling prev_state.
+    study_config["model.octree.warm_start_multiscale"] = WARM_MULTISCALE
+    study_config["model.octree.warm_start_multiscale_downsample_mode"] = WARM_MULTISCALE_DOWNSAMPLE_MODE
+    if WARM_MULTISCALE_START_LEVEL != "":
+        study_config["model.octree.warm_start_multiscale_start_level"] = int(WARM_MULTISCALE_START_LEVEL)
+    if WARM_MULTISCALE_STEPS != "":
+        if "," in WARM_MULTISCALE_STEPS:
+            study_config["model.octree.warm_start_multiscale_steps"] = [
+                int(x) for x in WARM_MULTISCALE_STEPS.split(",") if x.strip() != ""
+            ]
+        else:
+            study_config["model.octree.warm_start_multiscale_steps"] = int(WARM_MULTISCALE_STEPS)
+
+    # Warm-start logits policy (carry logits across frames can cause drift/instability).
+    # IOCT_WARM_LOGITS_MODE: carry|reset|gate
+    # IOCT_WARM_LOGITS_GATE_FROM (gate mode): hidden|state|hidden+input
+    study_config["model.octree.warm_start_logits_mode"] = WARM_LOGITS_MODE
+    study_config["model.octree.warm_start_logits_gate_from"] = WARM_LOGITS_GATE_FROM
+
+    # Hidden-state stabilization (applies to the carried recurrent hidden channels).
+    # IOCT_WARM_HIDDEN_NORM: none|layer|group
+    # IOCT_WARM_HIDDEN_CLIP: float (clamp to [-v, v])
+    # IOCT_WARM_HIDDEN_TANH_SCALE: float (bounds via tanh; keeps magnitude roughly <= scale)
+    # IOCT_WARM_HIDDEN_GN_GROUPS: int (groupnorm groups; falls back to 1 if incompatible)
+    study_config["model.octree.warm_start_hidden_norm"] = WARM_HIDDEN_NORM
+    if WARM_HIDDEN_CLIP != "":
+        study_config["model.octree.warm_start_hidden_clip"] = float(WARM_HIDDEN_CLIP)
+    if WARM_HIDDEN_TANH_SCALE != "":
+        study_config["model.octree.warm_start_hidden_tanh_scale"] = float(WARM_HIDDEN_TANH_SCALE)
+    if WARM_HIDDEN_GN_GROUPS != "":
+        study_config["model.octree.warm_start_hidden_gn_groups"] = int(WARM_HIDDEN_GN_GROUPS)
 
     dice_loss_weight = 1.0
     boundary_loss_weight = 0.1
@@ -338,7 +402,7 @@ def get_study_config():
     study_config["trainer.use_amp"] = True
 
     study_config["trainer.losses"] = [
-        "src.losses.DiceLoss.GeneralizedDiceLoss",
+        "src.losses.DiceLoss.nnUNetSoftDiceLossSum",
         "src.losses.LossFunctions.FocalLoss",
         "src.losses.DiceLoss.BoundaryLoss",
     ]
@@ -356,6 +420,8 @@ def get_study_config():
 
     study_config["experiment.dataset.precompute_boundary_dist"] = True
     study_config["experiment.dataset.boundary_dist_classes"] = None
+    study_config["trainer.gradient_clip_val"] = 1.0
+
 
     study_config["model.normalization"] = "none"
     study_config["model.apply_nonlin"] = "torch.nn.Softmax(dim=-1)"
@@ -367,13 +433,22 @@ def get_study_config():
     study_config["experiment.logging.track_gradient_norm"] = ENABLE_GRAD_NORM_LOGGING
     study_config["model.backbone.tbptt_steps"] = BACKBONE_TBPTT_STEPS
 
+    # Optional learning-rate controls for quick tuning without editing defaults.
+    # - IOCT_WARM_LR: set an explicit optimizer LR.
+    # - IOCT_WARM_LR_SCALE: multiply the current LR (default: 1.0).
+    if LR_OVERRIDE != "":
+        study_config["trainer.optimizer.lr"] = float(LR_OVERRIDE)
+    if LR_SCALE != 1.0:
+        study_config["trainer.optimizer.lr"] = float(study_config["trainer.optimizer.lr"]) * LR_SCALE
+
     # Spike monitoring (per-batch class counts + save batches on spikes)
     study_config["experiment.logging.spike_watch.enabled"] = True
+    dice_spike_keys = [f"nnUNetSoftDiceLossSum/mask_{i}" for i in range(max(0, full_num_classes - 1))]
     study_config["experiment.logging.spike_watch.keys"] = [
         "FocalLoss/loss",
-        "GeneralizedDiceLoss/loss",
-        "nnUNetSoftDiceLoss/mask_3",
-        "nnUNetSoftDiceLoss/mask_4",
+        "BoundaryLoss/loss",
+        "nnUNetSoftDiceLossSum/overall",
+        *dice_spike_keys,
     ]
     study_config["experiment.logging.spike_watch.window"] = 50
     study_config["experiment.logging.spike_watch.zscore"] = 3.0
@@ -408,7 +483,13 @@ def get_study_config():
     else:
         study_config["experiment.dataset.class_subset"] = None
 
-    study_config["experiment.name"] = f"WarmStart_M1Init_iOCT2D_{random_word}_{study_config['model.channel_n']}"
+    if RESUME_EXPERIMENT_NAME != "":
+        study_config["experiment.name"] = RESUME_EXPERIMENT_NAME
+    else:
+        study_config["experiment.name"] = f"WarmStart_M1Init_iOCT2D_{random_word}_{study_config['model.channel_n']}"
+
+    if RESUME_MODEL_PATH != "":
+        study_config["experiment.model_path"] = RESUME_MODEL_PATH
 
     return study_config
 
@@ -441,6 +522,9 @@ if __name__ == "__main__":
             "fullgraph": study_config.get("performance.compile.fullgraph"),
             "track_grad_norm": study_config.get("experiment.logging.track_gradient_norm", False),
             "tbptt_steps": study_config.get("model.backbone.tbptt_steps", None),
+            "seq_tbptt_steps": study_config.get("model.sequence.tbptt_steps", None),
+            "optimizer_lr": study_config.get("trainer.optimizer.lr"),
+            "lr_scale": LR_SCALE,
         },
     )
 

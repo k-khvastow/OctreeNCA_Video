@@ -281,10 +281,10 @@ def get_study_config():
     study_config["model.octree.res_and_steps"] = _build_octree_resolutions(
         input_size, steps, int(alpha * 20)
     )
-    study_config["model.kernel_size"] = [5] * len(study_config["model.octree.res_and_steps"])
+    study_config["model.kernel_size"] = [3] * len(study_config["model.octree.res_and_steps"])
 
     study_config["model.channel_n"] = 24
-    study_config["model.hidden_size"] = 32
+    study_config["model.hidden_size"] = 64
     study_config["trainer.batch_size"] = 4
     study_config["model.octree.separate_models"] = True
     study_config["model.backbone_class"] = "BasicNCA2DFast"
@@ -298,7 +298,7 @@ def get_study_config():
     study_config["trainer.use_amp"] = True
 
     study_config["trainer.losses"] = [
-        "src.losses.DiceLoss.GeneralizedDiceLoss",
+        "src.losses.DiceLoss.nnUNetSoftDiceLossSum",
         "src.losses.LossFunctions.FocalLoss",
         "src.losses.DiceLoss.BoundaryLoss",
     ]

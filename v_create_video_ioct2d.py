@@ -50,10 +50,16 @@ def _mask_to_rgb_bg(mask_bhwc: torch.Tensor, background_color=(0.0, 0.0, 0.0)) -
     else:
         mask = torch.from_numpy(mask_bhwc)
 
-    if mask.dtype != torch.bool:
-        mask = mask > 0
+    if mask.ndim != 4:
+        raise ValueError(f"Expected BHWC tensor, got shape {tuple(mask.shape)}")
 
     b, h, w, c = mask.shape
+    if c > 1:
+        class_idx = torch.argmax(mask, dim=-1)
+        mask = torch.nn.functional.one_hot(class_idx, num_classes=c).to(torch.bool)
+    elif mask.dtype != torch.bool:
+        mask = mask > 0.5
+
     bg = torch.tensor(background_color, dtype=torch.float32, device=mask.device)
     rgb = bg.view(1, 1, 1, 3).expand(b, h, w, 3).clone()
     for ci in range(1, c):

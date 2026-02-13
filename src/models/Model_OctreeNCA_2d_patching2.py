@@ -1,4 +1,3 @@
-from matplotlib import pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,9 +9,6 @@ import random
 import math
 import torch.nn.functional as F
 import subprocess as sp
-
-
-import matplotlib.pyplot as plt
 
 class OctreeNCA2DPatch2(torch.nn.Module):
     def __init__(self, config: dict):
@@ -94,6 +90,7 @@ class OctreeNCA2DPatch2(torch.nn.Module):
         assert backbone_class in [BasicNCA2D, BasicNCA2DFast], f"backbone_class must be either BasicNCA2D, got {backbone_class}"
         backbone_inplace_relu = bool(config.get("performance.inplace_operations", False))
         backbone_tbptt_steps = config.get("model.backbone.tbptt_steps", None)
+        backbone_spectral_norm = bool(config.get("model.spectral_norm", False))
 
         def _build_backbone(kernel_size_value):
             kwargs = dict(
@@ -108,6 +105,7 @@ class OctreeNCA2DPatch2(torch.nn.Module):
             if backbone_class == BasicNCA2DFast:
                 kwargs["inplace_relu"] = backbone_inplace_relu
                 kwargs["tbptt_steps"] = backbone_tbptt_steps
+                kwargs["use_spectral_norm"] = backbone_spectral_norm
             return backbone_class(**kwargs)
 
         if separate_models:
