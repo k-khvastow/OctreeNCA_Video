@@ -29,8 +29,55 @@ class OctreeNCA2DWarmStartM1Init(nn.Module):
         self.m1_use_probs = bool(config.get('model.m1.use_probs', False))
         self.m1_eval_mode = bool(config.get('model.m1.eval_mode', self.freeze_m1))
 
+        # M1/M2 weight transfer/sharing
+        # - model.m2.init_from_m1: one-time copy of backbone weights M1 -> M2
+        # - model.m2.share_backbone_with_m1: ties M2 backbone modules to M1 (true weight sharing)
+        self.m2_init_from_m1 = bool(config.get("model.m2.init_from_m1", False))
+        self.m2_share_backbone_with_m1 = bool(config.get("model.m2.share_backbone_with_m1", False))
+
         self._load_m1_weights()
+        self._sync_m2_from_m1()
         self._apply_m1_freeze()
+
+    def _sync_m2_from_m1(self) -> None:
+        if not self.m2_init_from_m1 and not self.m2_share_backbone_with_m1:
+            return
+
+        if self.m2_share_backbone_with_m1 and self.m2_init_from_m1:
+            raise ValueError(
+                "Set only one of model.m2.init_from_m1 or model.m2.share_backbone_with_m1."
+            )
+
+        if getattr(self.m1, "separate_models", None) != getattr(self.m2, "separate_models", None):
+            raise RuntimeError("M1 and M2 mismatch: separate_models differs.")
+
+        if self.m2_share_backbone_with_m1:
+            if self.freeze_m1 or self.m1_eval_mode:
+                raise ValueError(
+                    "model.m2.share_backbone_with_m1=True requires "
+                    "model.m1.freeze=False and model.m1.eval_mode=False, "
+                    "otherwise M2 will be frozen/eval as well."
+                )
+            if hasattr(self.m1, "backbone_ncas"):
+                self.m2.backbone_ncas = self.m1.backbone_ncas
+            else:
+                self.m2.backbone_nca = self.m1.backbone_nca
+            return
+
+        if not self.m2_init_from_m1:
+            return
+
+        # One-time initialization: copy backbone weights from M1 -> M2.
+        with torch.no_grad():
+            if hasattr(self.m1, "backbone_ncas"):
+                if len(self.m1.backbone_ncas) != len(self.m2.backbone_ncas):
+                    raise RuntimeError("M1 and M2 mismatch: backbone_ncas length differs.")
+                for i in range(len(self.m1.backbone_ncas)):
+                    self.m2.backbone_ncas[i].load_state_dict(
+                        self.m1.backbone_ncas[i].state_dict(), strict=True
+                    )
+            else:
+                self.m2.backbone_nca.load_state_dict(self.m1.backbone_nca.state_dict(), strict=True)
 
     def _resolve_m1_path(self, path: Optional[str]) -> Optional[str]:
         if path is None or path == "":

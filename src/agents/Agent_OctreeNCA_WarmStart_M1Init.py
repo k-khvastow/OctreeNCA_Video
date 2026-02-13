@@ -15,6 +15,13 @@ class OctreeNCAWarmStartM1InitAgent(MedNCAAgent):
         self.accum_iter = 0
         self._warned_no_supervision = False
 
+    def _as_device_tensor(self, x):
+        if x is None:
+            return None
+        if torch.is_tensor(x):
+            return x.to(self.device)
+        return torch.as_tensor(x, device=self.device)
+
     def _init_prev_state(self, x_seq: torch.Tensor, y_seq: torch.Tensor):
         use_m1 = self.exp.config.get('model.m1.use_first_frame', True)
 
@@ -29,12 +36,12 @@ class OctreeNCAWarmStartM1InitAgent(MedNCAAgent):
 
     def batch_step(self, data: dict, loss_f: torch.nn.Module) -> dict:
         accum_steps = int(self.exp.config.get('trainer.gradient_accumulation', 1))
+        seq_tbptt_steps = self.exp.config.get("model.sequence.tbptt_steps", None)
+        seq_tbptt_steps = int(seq_tbptt_steps) if seq_tbptt_steps not in (None, 0, "0", "") else None
 
-        x_seq = data['image'].to(self.device)
-        y_seq = data['label'].to(self.device)
-        y_dist_seq = data.get('label_dist', None)
-        if y_dist_seq is not None:
-            y_dist_seq = y_dist_seq.to(self.device)
+        x_seq = self._as_device_tensor(data['image'])
+        y_seq = self._as_device_tensor(data['label'])
+        y_dist_seq = self._as_device_tensor(data.get('label_dist', None))
 
         if x_seq.ndim == 4:
             x_seq = x_seq.unsqueeze(1)
@@ -125,6 +132,15 @@ class OctreeNCAWarmStartM1InitAgent(MedNCAAgent):
                     batch_stat_sums[k] += float(v)
 
             prev_state = out['final_state']
+            if (
+                seq_tbptt_steps is not None
+                and seq_tbptt_steps > 0
+                and prev_state is not None
+                and ((t - start_t + 1) % seq_tbptt_steps == 0)
+                and (t < T - 1)
+            ):
+                # Truncated BPTT across time: cap gradient length through prev_state.
+                prev_state = prev_state.detach()
 
         if steps == 0:
             if not self._warned_no_supervision:
@@ -219,15 +235,21 @@ class OctreeNCAWarmStartM1InitAgent(MedNCAAgent):
         pbar = tqdm(loader, desc=f"Eval {split}")
 
         for i, data in enumerate(pbar):
-            x_seq = data['image'].to(self.device)
-            y_seq = data['label'].to(self.device)
-            ids = data.get('id', [f"{i}"] * x_seq.shape[0])
+            x_seq = self._as_device_tensor(data['image'])
+            y_seq = self._as_device_tensor(data['label'])
 
             if x_seq.ndim == 4:
                 x_seq = x_seq.unsqueeze(1)
                 y_seq = y_seq.unsqueeze(1)
 
             B, T, C, H, W = x_seq.shape
+            raw_ids = data.get('id', None)
+            if raw_ids is None:
+                ids = [f"{i}_{b}" for b in range(B)]
+            elif isinstance(raw_ids, (list, tuple)):
+                ids = [str(pid) for pid in raw_ids]
+            else:
+                ids = [str(raw_ids)] * B
             prev_state, start_t, m1_out = self._init_prev_state(x_seq, y_seq)
 
             batch_scores_time = {}
@@ -243,16 +265,24 @@ class OctreeNCAWarmStartM1InitAgent(MedNCAAgent):
                     eval_out['pred'] = m1_out['logits'].permute(0, 3, 1, 2)
                 eval_out['target'] = y_seq[:, 0]
 
-                scores = loss_f(**eval_out)
+                for b in range(B):
+                    pid = ids[b] if b < len(ids) else f"unknown_{i}_{b}"
+                    scores = loss_f(
+                        pred=eval_out['pred'][b:b + 1],
+                        target=eval_out['target'][b:b + 1],
+                        patient_id=pid,
+                    )
+                    for k, v in scores.items():
+                        if k not in batch_scores_time:
+                            batch_scores_time[k] = {}
+                        if pid not in batch_scores_time[k]:
+                            batch_scores_time[k][pid] = []
+                        val = v.item() if isinstance(v, torch.Tensor) else v
+                        batch_scores_time[k][pid].append(val)
+
                 vis_x = x_seq[:, 0]
                 vis_y = y_seq[:, 0]
                 vis_pred = eval_out['pred']
-
-                for k, v in scores.items():
-                    if k not in batch_scores_time:
-                        batch_scores_time[k] = []
-                    val = v.item() if isinstance(v, torch.Tensor) else v
-                    batch_scores_time[k].append(val)
 
             for t in range(start_t, T):
                 x_t = x_seq[:, t]
@@ -268,27 +298,30 @@ class OctreeNCAWarmStartM1InitAgent(MedNCAAgent):
                     eval_out['pred'] = out['logits'].permute(0, 3, 1, 2)
                 eval_out['target'] = y_t
 
-                scores = loss_f(**eval_out)
+                for b in range(B):
+                    pid = ids[b] if b < len(ids) else f"unknown_{i}_{b}"
+                    scores = loss_f(
+                        pred=eval_out['pred'][b:b + 1],
+                        target=eval_out['target'][b:b + 1],
+                        patient_id=pid,
+                    )
+                    for k, v in scores.items():
+                        if k not in batch_scores_time:
+                            batch_scores_time[k] = {}
+                        if pid not in batch_scores_time[k]:
+                            batch_scores_time[k][pid] = []
+                        val = v.item() if isinstance(v, torch.Tensor) else v
+                        batch_scores_time[k][pid].append(val)
 
                 vis_x = x_t
                 vis_y = y_t
                 vis_pred = eval_out['pred']
 
-                for k, v in scores.items():
-                    if k not in batch_scores_time:
-                        batch_scores_time[k] = []
-                    val = v.item() if isinstance(v, torch.Tensor) else v
-                    batch_scores_time[k].append(val)
-
-            for metric_name, values in batch_scores_time.items():
-                avg_score = np.mean(values)
-
+            for metric_name, metric_pid_values in batch_scores_time.items():
                 if metric_name not in loss_log:
                     loss_log[metric_name] = {}
-
-                for b in range(B):
-                    pid = ids[b] if b < len(ids) else f"unknown_{i}_{b}"
-                    loss_log[metric_name][pid] = avg_score
+                for pid, values in metric_pid_values.items():
+                    loss_log[metric_name][pid] = float(np.mean(values))
 
             if i in save_img and vis_x is not None and vis_y is not None and vis_pred is not None:
                 image_bhwc = vis_x.detach().cpu().permute(0, 2, 3, 1)
@@ -307,8 +340,14 @@ class OctreeNCAWarmStartM1InitAgent(MedNCAAgent):
                         self.exp.currentStep,
                     )
 
-            if 'DiceScore' in batch_scores_time:
-                pbar.set_postfix({'dice': np.mean(batch_scores_time['DiceScore'])})
+            dice_keys = [k for k in batch_scores_time.keys() if 'DiceScore' in k]
+            if len(dice_keys) > 0:
+                dice_values = []
+                for dk in dice_keys:
+                    for values in batch_scores_time[dk].values():
+                        dice_values.extend(values)
+                if len(dice_values) > 0:
+                    pbar.set_postfix({'dice': float(np.mean(dice_values))})
 
         print(f"\n[{split.upper()} SCORES]")
         for metric, scores_dict in loss_log.items():
