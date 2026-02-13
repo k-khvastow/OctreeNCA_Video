@@ -174,16 +174,26 @@ class Experiment():
         if 'experiment.run_hash' in config_keys:
             config_keys.remove('experiment.run_hash')
 
+        def _config_values_equal(current_v, loaded_v):
+            # Treat list/tuple with identical contents as equal for config-compat checks.
+            if isinstance(current_v, (list, tuple)) and isinstance(loaded_v, (list, tuple)):
+                return list(current_v) == list(loaded_v)
+            return current_v == loaded_v
+
         for k, v in loaded_config.items():
             if k == "experiment.run_hash":
                 pass
             elif k == "experiment.git_hash":
-                config_keys.remove(k)
+                if k in config_keys:
+                    config_keys.remove(k)
             else:
-                config_keys.remove(k)
+                if k in config_keys:
+                    config_keys.remove(k)
+                if k not in self.config:
+                    # Keep loaded-only keys without blocking resume; they are merged below.
+                    continue
                 valid = True
-                valid = valid and k in self.config
-                valid = valid and self.config[k] == v
+                valid = valid and _config_values_equal(self.config[k], v)
                 if not valid:
                     print(f"Configurations do not match on key '{k}'. Check if you are loading the correct experiment.")
                     print(f"Loaded: {v} | Current: {self.config.get(k, None)}")

@@ -160,15 +160,26 @@ def merge_img_label_gt_simplified(img: torch.Tensor, pred: torch.Tensor, gt: tor
 
     assert pred.shape[3] == gt.shape[3]
     if segmentation:
-        #sigmoid (on logits)
-        pred = pred > 0
-        gt = gt > 0
-        # softmax:
-        #num_classes = pred.shape[3]
-        #pred = pred.argmax(dim=-1)
-        #gt = gt.argmax(dim=-1)
-        #pred = F.one_hot(pred, num_classes=num_classes).bool()
-        #gt = F.one_hot(gt, num_classes=num_classes).bool()
+        num_classes = int(pred.shape[3])
+        if num_classes <= 0:
+            raise ValueError(f"Expected pred/gt with at least 1 channel, got {pred.shape} {gt.shape}")
+
+        # For multi-class segmentation (softmax logits/probabilities), thresholding per channel
+        # makes multiple classes active per pixel (visually "thick"/overlapping). Use argmax.
+        if num_classes > 1:
+            pred_idx = pred.argmax(dim=-1)
+            gt_idx = gt.argmax(dim=-1)
+            pred = F.one_hot(pred_idx, num_classes=num_classes).bool()
+            gt = F.one_hot(gt_idx, num_classes=num_classes).bool()
+        else:
+            # Binary / single-channel mask:
+            # - If values look like logits, use 0 (equiv. sigmoid > 0.5).
+            # - If values look like probabilities, use 0.5.
+            pred_min = float(pred.min().item())
+            pred_max = float(pred.max().item())
+            pred_is_prob = (pred_min >= 0.0) and (pred_max <= 1.0)
+            pred = pred > (0.5 if pred_is_prob else 0.0)
+            gt = gt > 0.5
 
         label_img = torch.zeros(img.shape[0],img.shape[1],img.shape[2], 3)
         gt_img = torch.zeros(img.shape[0],img.shape[1],img.shape[2], 3)
