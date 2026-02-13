@@ -1,5 +1,5 @@
 import torch
-import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
 class PatchwiseIoUScore(torch.nn.Module):
 
@@ -25,8 +25,22 @@ class PatchwiseIoUScore(torch.nn.Module):
             for m in range(target.shape[-1]):
                 self.false_negatives.append(dict())
 
-        
-        output = (output > 0).int()
+        num_classes = int(target.shape[-1])
+        if num_classes <= 0:
+            raise ValueError(f"Expected target with at least 1 channel, got shape {target.shape}")
+
+        if num_classes > 1:
+            output_idx = output.argmax(dim=-1)
+            target_idx = target.argmax(dim=-1)
+            output = F.one_hot(output_idx, num_classes=num_classes).int()
+            target = F.one_hot(target_idx, num_classes=num_classes).int()
+        else:
+            output_min = float(output.min().item())
+            output_max = float(output.max().item())
+            output_is_prob = (output_min >= 0.0) and (output_max <= 1.0)
+            output = (output > (0.5 if output_is_prob else 0.0)).int()
+            target = (target > 0.5).int()
+
         d = {}
         for m in range(target.shape[-1]):
             if not patient_id in self.true_positives[m]:

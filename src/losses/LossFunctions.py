@@ -227,6 +227,9 @@ class FocalLoss(torch.nn.Module):
                 alpha_t = alpha_t[valid]
             focal = focal * alpha_t
 
+        # Guard against empty valid set (e.g. all pixels are ignore_index)
+        if focal.numel() == 0:
+            return torch.zeros(1, device=input.device, dtype=input.dtype).squeeze()
         if self.reduction == "mean":
             return focal.mean()
         if self.reduction == "sum":

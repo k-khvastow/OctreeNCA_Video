@@ -168,6 +168,28 @@ class nnUNetSoftDiceLoss(torch.nn.Module):
         return -dc, loss_ret
 
 
+class nnUNetSoftDiceLossSum(nnUNetSoftDiceLoss):
+    """
+    Sum of per-class soft Dice losses.
+    Reuses nnUNetSoftDiceLoss internals/logging but returns a scalar loss:
+      sum_c (1 - Dice_c)
+    """
+    def forward(self, x=None, y=None, loss_mask=None, logits=None, target=None, **kwargs):
+        dc_neg, loss_ret = super().forward(
+            x=x,
+            y=y,
+            loss_mask=loss_mask,
+            logits=logits,
+            target=target,
+            **kwargs,
+        )
+        # super returns -dc; convert to per-class dice losses (1 - dc) and sum.
+        dice_loss_sum = (1.0 + dc_neg).sum()
+        with torch.no_grad():
+            loss_ret["sum"] = dice_loss_sum.item()
+        return dice_loss_sum, loss_ret
+
+
 class GeneralizedDiceLoss(torch.nn.Module):
     """
     Generalized Dice Loss with inverse-squared volume weights.
