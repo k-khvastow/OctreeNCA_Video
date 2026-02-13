@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.parametrizations import spectral_norm
 try:
     import nca_cuda
 except:
@@ -8,7 +9,7 @@ except:
  
 class BasicNCA2DFast(nn.Module):
     def __init__(self, channel_n, fire_rate, device, hidden_size=128, input_channels=1, init_method="standard", kernel_size=7, groups=False,
-                 inplace_relu=False, normalization="batch", tbptt_steps=None):
+                 inplace_relu=False, normalization="batch", tbptt_steps=None, use_spectral_norm=False):
         r"""Init function
             #Args:
                 channel_n: number of channels per cell
@@ -19,6 +20,8 @@ class BasicNCA2DFast(nn.Module):
                 init_method: Weight initialisation function
                 kernel_size: defines kernel input size
                 groups: if channels in input should be interconnected
+                use_spectral_norm: apply spectral normalization to fc1 (residual layer)
+                    to enforce contractive dynamics and long-horizon stability
         """
         super().__init__()
         self.use_forward_cuda = False
@@ -36,6 +39,12 @@ class BasicNCA2DFast(nn.Module):
         padding = int((kernel_size-1) / 2)
 
         self.conv = nn.Conv2d(channel_n, channel_n, kernel_size=kernel_size, stride=1, padding=padding, padding_mode="reflect", groups=channel_n)
+
+        # Apply spectral norm to the residual layer to guarantee contractive
+        # dynamics (Lipschitz constant ≤ 1).  This prevents hidden state
+        # explosion over long autoregressive rollouts.
+        if use_spectral_norm:
+            self.fc1 = spectral_norm(self.fc1)
         
         if normalization == "batch":
             self.bn = torch.nn.BatchNorm2d(hidden_size, track_running_stats=False)
