@@ -606,20 +606,136 @@ class BaseAgent():
         if self.exp.get_from_config('trainer.ema'):
             torch.save(self.ema.shadow, os.path.join(model_path, 'ema.pth'))
 
+    def _remap_spectral_norm_state_keys(self, state: dict) -> dict:
+        """Map spectral-norm parametrized keys to plain weights and vice-versa."""
+        model_state = self.model.state_dict()
+        model_keys = set(model_state.keys())
+        remapped = dict(state)
+
+        for key in list(remapped.keys()):
+            if key in model_keys:
+                continue
+
+            if key.endswith(".weight"):
+                param_key = key.replace(".weight", ".parametrizations.weight.original")
+                if param_key in model_keys:
+                    remapped[param_key] = remapped.pop(key)
+                    prefix = key.rsplit(".weight", 1)[0]
+                    for suffix in (
+                        ".parametrizations.weight.0._u",
+                        ".parametrizations.weight.0._v",
+                    ):
+                        buf_key = prefix + suffix
+                        if buf_key in model_keys and buf_key not in remapped:
+                            remapped[buf_key] = model_state[buf_key]
+                    continue
+
+            if ".parametrizations.weight.original" in key:
+                plain_key = key.replace(".parametrizations.weight.original", ".weight")
+                if plain_key in model_keys:
+                    remapped[plain_key] = remapped.pop(key)
+                    continue
+
+            if (
+                ".parametrizations.weight.0._u" in key
+                or ".parametrizations.weight.0._v" in key
+            ) and key not in model_keys:
+                remapped.pop(key)
+
+        return remapped
+
+    def _load_model_state_compat(self, state_path: str) -> None:
+        state = self._torch_load_compat(state_path, map_location="cpu", weights_only=True)
+        state = self._remap_spectral_norm_state_keys(state)
+        self.model.load_state_dict(state)
+
+    @staticmethod
+    def _torch_load_compat(state_path: str, map_location="cpu", weights_only=False):
+        try:
+            return torch.load(state_path, map_location=map_location, weights_only=weights_only)
+        except TypeError:
+            return torch.load(state_path, map_location=map_location)
+        except Exception as exc:
+            if weights_only and "Weights only load failed" in str(exc):
+                try:
+                    return torch.load(state_path, map_location=map_location, weights_only=False)
+                except TypeError:
+                    return torch.load(state_path, map_location=map_location)
+            raise
+
+    def _remap_ema_shadow_keys(self, loaded_shadow: dict) -> dict:
+        if not isinstance(loaded_shadow, dict):
+            raise TypeError(f"EMA shadow must be a dict, got {type(loaded_shadow)}")
+
+        expected_shadow = self.ema.shadow
+        expected_keys = set(expected_shadow.keys())
+        remapped = dict(loaded_shadow)
+
+        for key in list(remapped.keys()):
+            if key in expected_keys:
+                continue
+
+            if key.endswith(".weight"):
+                param_key = key.replace(".weight", ".parametrizations.weight.original")
+                if param_key in expected_keys:
+                    remapped[param_key] = remapped.pop(key)
+                    continue
+
+            if ".parametrizations.weight.original" in key:
+                plain_key = key.replace(".parametrizations.weight.original", ".weight")
+                if plain_key in expected_keys:
+                    remapped[plain_key] = remapped.pop(key)
+                    continue
+
+        merged = {}
+        missing = []
+        for key, current in expected_shadow.items():
+            if key in remapped:
+                value = remapped[key]
+                if torch.is_tensor(value):
+                    value = value.cpu()
+                merged[key] = value
+            else:
+                merged[key] = current
+                missing.append(key)
+
+        unexpected = [key for key in remapped.keys() if key not in expected_keys]
+        if len(missing) > 0 or len(unexpected) > 0:
+            print(
+                "[EMA] Loaded shadow keys differ from current model "
+                f"(missing={len(missing)}, unexpected={len(unexpected)}). "
+                "Using compatible overlap and keeping current EMA values for missing keys."
+            )
+
+        return merged
+
     def load_state(self, model_path: str, pretrained=False) -> None:
         r"""Load state of current model
         """
-        self.model.load_state_dict(torch.load(os.path.join(model_path, 'model.pth')))
+        self._load_model_state_compat(os.path.join(model_path, 'model.pth'))
         if not pretrained:
-            self.optimizer.load_state_dict(torch.load(os.path.join(model_path, 'optimizer.pth')))
-            self.scheduler.load_state_dict(torch.load(os.path.join(model_path, 'scheduler.pth')))
+            optimizer_state = self._torch_load_compat(
+                os.path.join(model_path, 'optimizer.pth'),
+                map_location='cpu',
+                weights_only=False,
+            )
+            scheduler_state = self._torch_load_compat(
+                os.path.join(model_path, 'scheduler.pth'),
+                map_location='cpu',
+                weights_only=False,
+            )
+            self.optimizer.load_state_dict(optimizer_state)
+            self.scheduler.load_state_dict(scheduler_state)
             if self.exp.get_from_config('trainer.find_best_model_on') is not None:
                 self.best_model = load_json_file(os.path.join(pc.FILER_BASE_PATH, self.exp.config['experiment.model_path'], 'best_model.json'))
         
         if self.exp.get_from_config('trainer.ema'):
-            loaded_shadow = torch.load(os.path.join(model_path, 'ema.pth'))
-            assert self.ema.shadow.keys() == loaded_shadow.keys(), "Loaded EMA shadow does not match model parameters!"
-            self.ema.shadow = loaded_shadow
+            loaded_shadow = self._torch_load_compat(
+                os.path.join(model_path, 'ema.pth'),
+                map_location='cpu',
+                weights_only=True,
+            )
+            self.ema.shadow = self._remap_ema_shadow_keys(loaded_shadow)
 
     def train(self, dataloader: DataLoader, loss_f: torch.Tensor) -> None:
         r"""Execute training of model
