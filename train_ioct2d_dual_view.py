@@ -79,6 +79,7 @@ class iOCTPairedViewsDatasetForExperiment(Dataset_Base):
         class_subset=None,
         precompute_boundary_dist: bool = False,
         boundary_dist_classes=None,
+        max_samples: int = None,
     ):
         super().__init__()
         self.data_root = Path(data_root)
@@ -92,6 +93,7 @@ class iOCTPairedViewsDatasetForExperiment(Dataset_Base):
         self.size = input_size
         self.precompute_boundary_dist = precompute_boundary_dist
         self.boundary_dist_classes = boundary_dist_classes
+        self.max_samples = max_samples
 
         # Required by agents
         self.slice = -1
@@ -161,6 +163,10 @@ class iOCTPairedViewsDatasetForExperiment(Dataset_Base):
                 }
                 self.pairs.append(info)
                 self.pairs_dict[pair_id] = info
+
+        if self.max_samples is not None and self.max_samples > 0:
+            self.pairs = self.pairs[:self.max_samples]
+            self.pairs_dict = {p["id"]: p for p in self.pairs}
 
         print(f"Found {len(self.pairs)} paired iOCT frames ({self.view_a}+{self.view_b}).")
 
