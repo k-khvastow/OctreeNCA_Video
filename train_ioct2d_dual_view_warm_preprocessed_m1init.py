@@ -81,6 +81,12 @@ TEMPORAL_CONSISTENCY_WEIGHT = os.getenv(
     os.getenv("IOCT_WARM_TEMPORAL_CONSISTENCY_WEIGHT", ""),
 ).strip()
 
+IOCT_M1_FREEZE = os.getenv("IOCT_M1_FREEZE", "0") == "1"
+M1_DISABLE_BACKBONE_TBPTT = os.getenv(
+    "IOCT_DUAL_WARM_M1_DISABLE_BACKBONE_TBPTT",
+    os.getenv("IOCT_WARM_M1_DISABLE_BACKBONE_TBPTT", "1"),
+) == "1"
+
 INIT_M2_FROM_M1 = os.getenv(
     "IOCT_DUAL_WARM_INIT_M2_FROM_M1", os.getenv("IOCT_WARM_INIT_M2_FROM_M1", "1")
 ) == "1"
@@ -129,6 +135,11 @@ WARM_HIDDEN_TANH_SCALE = os.getenv(
 WARM_HIDDEN_GN_GROUPS = os.getenv(
     "IOCT_DUAL_WARM_HIDDEN_GN_GROUPS", os.getenv("IOCT_WARM_HIDDEN_GN_GROUPS", "")
 ).strip()
+
+# --- Learned temporal gate on hidden channels ("none" or "gru") ---
+WARM_TEMPORAL_GATE = os.getenv(
+    "IOCT_DUAL_WARM_TEMPORAL_GATE", os.getenv("IOCT_WARM_TEMPORAL_GATE", "none")
+).strip().lower()
 
 DATASETS = ["peeling", "sri"]
 VIEWS = ["A", "B"]
@@ -500,7 +511,7 @@ def get_study_config():
     study_config["trainer.n_epochs"] = 100
 
     # Model specifics
-    steps = 10
+    steps = 8
     alpha = 1.0
     input_size = study_config["experiment.dataset.input_size"]
     study_config["model.backbone_class"] = "BasicNCA2DFast"
@@ -523,10 +534,11 @@ def get_study_config():
 
     # M1 init options
     study_config["model.m1.pretrained_path"] = M1_CHECKPOINT_PATH
-    study_config["model.m1.freeze"] = True
+    study_config["model.m1.freeze"] = IOCT_M1_FREEZE
     study_config["model.m1.use_first_frame"] = True
     study_config["model.m1.use_t0_for_loss"] = False
     study_config["model.m1.use_probs"] = False
+    study_config["model.m1.disable_backbone_tbptt"] = M1_DISABLE_BACKBONE_TBPTT
 
     # M2 init / weight sharing options
     study_config["model.m2.init_from_m1"] = INIT_M2_FROM_M1
@@ -577,12 +589,17 @@ def get_study_config():
     if WARM_HIDDEN_GN_GROUPS != "":
         study_config["model.octree.warm_start_hidden_gn_groups"] = int(WARM_HIDDEN_GN_GROUPS)
 
+    # Learned temporal gate
+    study_config["model.octree.warm_start_temporal_gate"] = WARM_TEMPORAL_GATE
+
     dice_loss_weight = 1.0
     boundary_loss_weight = 0.1
-    ema_decay = 0.99
+    # EMA stores a full copy of model weights – disable to save ~50% param VRAM.
+    _ema_env = os.getenv("IOCT_DUAL_WARM_EMA", os.getenv("IOCT_WARM_EMA", "1"))
+    ema_decay = 0.99 if _ema_env == "1" else 0.0
     study_config["trainer.ema"] = ema_decay > 0.0
     study_config["trainer.ema.decay"] = ema_decay
-    study_config["trainer.use_amp"] = True
+    study_config["trainer.use_amp"] = False
 
     study_config["trainer.losses"] = [
         "src.losses.DiceLoss.nnUNetSoftDiceLossSum",

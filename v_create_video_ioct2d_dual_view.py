@@ -1,3 +1,6 @@
+#
+#python v_create_video_ioct2d_dual_view.py --random_word veneer --warm_m1init
+#
 import argparse
 import os
 
