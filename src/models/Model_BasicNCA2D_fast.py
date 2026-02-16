@@ -40,12 +40,6 @@ class BasicNCA2DFast(nn.Module):
 
         self.conv = nn.Conv2d(channel_n, channel_n, kernel_size=kernel_size, stride=1, padding=padding, padding_mode="reflect", groups=channel_n)
 
-        # Apply spectral norm to the residual layer to guarantee contractive
-        # dynamics (Lipschitz constant ≤ 1).  This prevents hidden state
-        # explosion over long autoregressive rollouts.
-        if use_spectral_norm:
-            self.fc1 = spectral_norm(self.fc1)
-        
         if normalization == "batch":
             self.bn = torch.nn.BatchNorm2d(hidden_size, track_running_stats=False)
         elif normalization == "layer":
@@ -59,8 +53,20 @@ class BasicNCA2DFast(nn.Module):
         else:
             raise ValueError(f"Unknown normalization type {normalization}")
         
+        # Zero-init the residual layer so NCA starts as an identity mapping.
+        # Must happen BEFORE spectral_norm wrapping: zeroing a spectrally-
+        # normalised weight causes 0/0 = NaN.
         with torch.no_grad():
             self.fc1.weight.zero_()
+
+        # Apply spectral norm to the residual layer to guarantee contractive
+        # dynamics (Lipschitz constant ≤ 1).  This prevents hidden state
+        # explosion over long autoregressive rollouts.
+        if use_spectral_norm:
+            # Use a tiny epsilon init so sigma_1(W) > 0 at the first forward.
+            with torch.no_grad():
+                self.fc1.weight.add_(torch.randn_like(self.fc1.weight) * 1e-6)
+            self.fc1 = spectral_norm(self.fc1)
 
         if init_method == "xavier":
             torch.nn.init.xavier_uniform(self.fc0.weight)
