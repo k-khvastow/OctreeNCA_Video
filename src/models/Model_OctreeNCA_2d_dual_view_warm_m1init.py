@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
 import torch
@@ -32,6 +33,7 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
 
         self.m2_init_from_m1 = bool(config.get("model.m2.init_from_m1", False))
         self.m2_share_backbone_with_m1 = bool(config.get("model.m2.share_backbone_with_m1", False))
+        self.m1_disable_backbone_tbptt = bool(config.get("model.m1.disable_backbone_tbptt", False))
 
         self._load_m1_weights()
         self._sync_m2_from_m1()
@@ -123,12 +125,50 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
 
         return remapped
 
+    @staticmethod
+    def _align_compiled_keys(state: dict, model_keys: set) -> dict:
+        """Align state-dict keys with model keys regardless of ``_orig_mod.`` prefix.
+
+        Handles both directions:
+        - checkpoint has ``_orig_mod.`` but model does not  -> strip prefix
+        - checkpoint lacks ``_orig_mod.`` but model has it  -> add prefix
+        """
+        # Fast path: already aligned
+        if state.keys() == model_keys:
+            return state
+
+        aligned: dict = {}
+        for key, value in state.items():
+            if key in model_keys:
+                aligned[key] = value
+            else:
+                # Try stripping the prefix
+                stripped = key.replace("_orig_mod.", "")
+                if stripped in model_keys:
+                    aligned[stripped] = value
+                else:
+                    # Try adding the prefix at each '.' boundary
+                    parts = key.split(".")
+                    found = False
+                    for i in range(len(parts)):
+                        candidate = ".".join(parts[: i + 1] + ["_orig_mod"] + parts[i + 1 :])
+                        if candidate in model_keys:
+                            aligned[candidate] = value
+                            found = True
+                            break
+                    if not found:
+                        # Keep original key; let load_state_dict report the mismatch
+                        aligned[key] = value
+        return aligned
+
     def _load_m1_weights(self) -> None:
         path = self._resolve_m1_path(self.config.get("model.m1.pretrained_path", None))
         if path is None:
             return
         strict = bool(self.config.get("model.m1.load_strict", True))
         state = torch.load(path, map_location="cpu")
+        model_keys = set(self.m1.state_dict().keys())
+        state = self._align_compiled_keys(state, model_keys)
         state = self._remap_spectral_norm_keys(state, self.m1.state_dict())
         self.m1.load_state_dict(state, strict=strict)
 
@@ -165,12 +205,44 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
                 dtype=x_b.dtype,
             )
 
-        if self.freeze_m1:
-            with torch.no_grad():
+        with self._temporary_disable_m1_backbone_tbptt():
+            if self.freeze_m1:
+                with torch.no_grad():
+                    out = self.m1(x_a, x_b, y_a, y_b)
+            else:
                 out = self.m1(x_a, x_b, y_a, y_b)
-        else:
-            out = self.m1(x_a, x_b, y_a, y_b)
         return out
+
+    @staticmethod
+    def _unwrap_compiled_module(module: nn.Module) -> nn.Module:
+        while hasattr(module, "_orig_mod"):
+            module = module._orig_mod
+        return module
+
+    def _iter_backbone_modules(self, model: nn.Module):
+        if hasattr(model, "backbone_ncas"):
+            for backbone in model.backbone_ncas:
+                yield self._unwrap_compiled_module(backbone)
+        elif hasattr(model, "backbone_nca"):
+            yield self._unwrap_compiled_module(model.backbone_nca)
+
+    @contextmanager
+    def _temporary_disable_m1_backbone_tbptt(self):
+        if not self.m1_disable_backbone_tbptt:
+            yield
+            return
+
+        restored = []
+        for backbone in self._iter_backbone_modules(self.m1):
+            if hasattr(backbone, "tbptt_steps"):
+                restored.append((backbone, backbone.tbptt_steps))
+                backbone.tbptt_steps = None
+
+        try:
+            yield
+        finally:
+            for backbone, tbptt_steps in restored:
+                backbone.tbptt_steps = tbptt_steps
 
     def _split_dual_batch(self, tensor: torch.Tensor, batch_size: int, name: str):
         if tensor.shape[0] != 2 * batch_size:
