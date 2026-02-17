@@ -266,6 +266,16 @@ class GeneralizedDiceLoss(torch.nn.Module):
 
         with torch.no_grad():
             loss_ret = {"overall": loss.mean().item()}
+            # Per-class Dice scores for monitoring (unweighted)
+            per_class_num = 2.0 * tp + self.smooth
+            per_class_den = 2.0 * tp + fp + fn + self.smooth
+            per_class_dc = per_class_num / (per_class_den + 1e-8)
+            if self.batch_dice:
+                for _class in range(per_class_dc.shape[0]):
+                    loss_ret[f"mask_{_class}"] = 1 - per_class_dc[_class].item()
+            else:
+                for _class in range(per_class_dc.shape[1]):
+                    loss_ret[f"mask_{_class}"] = 1 - per_class_dc[:, _class].mean().item()
 
         return loss, loss_ret
 

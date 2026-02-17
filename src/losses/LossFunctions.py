@@ -222,7 +222,8 @@ class FocalLoss(torch.nn.Module):
                 alpha = torch.tensor(self.alpha, device=input.device, dtype=input.dtype)
             else:
                 alpha = self.alpha.to(input.device, input.dtype)
-            alpha_t = alpha.gather(0, target.clamp_min(0))
+            # alpha is [C]; index it by class labels (target may be multi-dim)
+            alpha_t = alpha[target.clamp_min(0)]
             if valid is not None:
                 alpha_t = alpha_t[valid]
             focal = focal * alpha_t
