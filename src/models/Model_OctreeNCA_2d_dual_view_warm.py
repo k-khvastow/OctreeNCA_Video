@@ -44,6 +44,13 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         # Will be set by the agent at each epoch to control annealing
         self._current_epoch = 0
 
+        # --- Temporal vs. Spatial hidden channel split ---
+        # Partition hidden channels into temporal (carried across frames)
+        # and spatial (reset to zero each frame).  A ratio of 1.0 means all
+        # hidden channels are temporal (legacy behaviour); 0.5 carries only
+        # half and resets the rest.
+        self.temporal_ratio = float(config.get("model.octree.warm_start_temporal_ratio", 1.0))
+
         hidden_dim = self.channel_n - self.input_channels - self.output_channels
         self._warm_hidden_ln = None
         self._warm_hidden_gn = None
@@ -61,6 +68,10 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
                 raise ValueError(
                     "model.octree.warm_start_hidden_norm must be one of: 'none', 'layer', 'group'."
                 )
+
+        # Pre-compute temporal/spatial split indices (used in warm-start paths)
+        self.n_temporal = int(hidden_dim * self.temporal_ratio)
+        self.n_spatial = hidden_dim - self.n_temporal
 
         self.warm_start_logits_mode = str(config.get("model.octree.warm_start_logits_mode", "carry")).lower()
         self.warm_start_logits_gate_from = str(
@@ -83,6 +94,36 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
             with torch.no_grad():
                 self._logits_gate_conv.weight.zero_()
                 self._logits_gate_conv.bias.fill_(2.0)
+
+        # Temporal blending gate between previous and candidate states.
+        self.temporal_gate_mode = str(
+            config.get("model.octree.warm_start_temporal_gate", "gru")
+        ).lower()
+        if self.temporal_gate_mode == "gru":
+            # GRU-style: sees both prev and candidate full state.
+            self.temporal_gate = nn.Conv2d(
+                self.channel_n * 2, self.channel_n, kernel_size=1, bias=True
+            )
+            with torch.no_grad():
+                self.temporal_gate.weight.zero_()
+                # Conservative update at init (sigmoid(-2) ~= 0.12).
+                self.temporal_gate.bias.fill_(-2.0)
+        elif self.temporal_gate_mode == "simple":
+            # Lightweight gate: 1x1 conv over (input + hidden) → hidden, sigmoid.
+            # Only gates hidden channels; input/output channels handled separately.
+            self.temporal_gate = nn.Conv2d(
+                self.input_channels + hidden_dim, hidden_dim, kernel_size=1, bias=True
+            )
+            with torch.no_grad():
+                self.temporal_gate.weight.zero_()
+                self.temporal_gate.bias.fill_(-2.0)
+        elif self.temporal_gate_mode == "none":
+            self.temporal_gate = None
+        else:
+            raise ValueError(
+                "model.octree.warm_start_temporal_gate must be one of: "
+                "'gru', 'simple', 'none'."
+            )
 
     def _run_backbone_with_steps(self, x_bchw: torch.Tensor, level: int, steps: int):
         old_steps = self.inference_steps[level]
@@ -248,6 +289,22 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
 
         return state_a, state_b
 
+    def _reset_spatial_channels(self, state: torch.Tensor) -> torch.Tensor:
+        """Zero out spatial-only hidden channels.
+
+        When ``temporal_ratio < 1.0`` the hidden channels are partitioned into
+        *temporal* channels (indices ``hidden_start .. hidden_start + n_temporal``)
+        which are carried across frames, and *spatial* channels (the rest)
+        which are reset to zero so the NCA gets a clean slate for
+        spatial-only features.
+        """
+        if self.n_spatial <= 0:
+            return state
+        hidden_start = self.input_channels + self.output_channels
+        temporal_end = hidden_start + self.n_temporal
+        state[:, temporal_end:] = 0.0
+        return state
+
     def _forward_warm_single_scale(
         self,
         x_a: torch.Tensor,
@@ -258,6 +315,10 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         input_ch = self.input_channels
         state_a = prev_state_a.clone()
         state_b = prev_state_b.clone()
+
+        # Reset spatial-only hidden channels before injecting new inputs
+        state_a = self._reset_spatial_channels(state_a)
+        state_b = self._reset_spatial_channels(state_b)
 
         state_a[:, :input_ch] = x_a[:, :input_ch]
         state_b[:, :input_ch] = x_b[:, :input_ch]
@@ -274,8 +335,35 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         steps = int(self.warm_start_steps)
         state_ab = torch.cat([state_a, state_b], dim=0)
         state_ab = self._run_backbone_with_steps(state_ab, level=0, steps=steps)
-        state_a, state_b = state_ab.chunk(2, dim=0)
-        state_a, state_b = self._maybe_cross_fuse(state_a, state_b, level=0)
+        cand_state_a, cand_state_b = state_ab.chunk(2, dim=0)
+        cand_state_a, cand_state_b = self._maybe_cross_fuse(cand_state_a, cand_state_b, level=0)
+
+        if self.temporal_gate_mode == "gru":
+            z_a = torch.sigmoid(self.temporal_gate(torch.cat([prev_state_a, cand_state_a], dim=1)))
+            z_b = torch.sigmoid(self.temporal_gate(torch.cat([prev_state_b, cand_state_b], dim=1)))
+            state_a = (1.0 - z_a) * prev_state_a + z_a * cand_state_a
+            state_b = (1.0 - z_b) * prev_state_b + z_b * cand_state_b
+        elif self.temporal_gate_mode == "simple":
+            hidden_start = input_ch + self.output_channels
+            # Gate features: input channels + hidden channels from candidate.
+            feat_a = torch.cat([cand_state_a[:, :input_ch], cand_state_a[:, hidden_start:]], dim=1)
+            feat_b = torch.cat([cand_state_b[:, :input_ch], cand_state_b[:, hidden_start:]], dim=1)
+            z_a = torch.sigmoid(self.temporal_gate(feat_a))
+            z_b = torch.sigmoid(self.temporal_gate(feat_b))
+            # Only gate hidden channels; logits come from candidate.
+            state_a = cand_state_a.clone()
+            state_b = cand_state_b.clone()
+            state_a[:, hidden_start:] = (1.0 - z_a) * prev_state_a[:, hidden_start:] + z_a * cand_state_a[:, hidden_start:]
+            state_b[:, hidden_start:] = (1.0 - z_b) * prev_state_b[:, hidden_start:] + z_b * cand_state_b[:, hidden_start:]
+        else:
+            # No temporal gate – candidate state is used directly.
+            state_a = cand_state_a
+            state_b = cand_state_b
+
+        # Keep current-frame input channels exact after temporal blending.
+        state_a[:, :input_ch] = x_a[:, :input_ch]
+        state_b[:, :input_ch] = x_b[:, :input_ch]
+
         state_a = self._stabilize_hidden_state_bchw(state_a)
         state_b = self._stabilize_hidden_state_bchw(state_b)
         return state_a, state_b
@@ -320,6 +408,10 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         else:
             state_a = self._interp_bchw(prev_state_a, self.octree_res[start_level], mode=mode)
             state_b = self._interp_bchw(prev_state_b, self.octree_res[start_level], mode=mode)
+
+        # Reset spatial-only hidden channels before injecting new inputs
+        state_a = self._reset_spatial_channels(state_a)
+        state_b = self._reset_spatial_channels(state_b)
 
         input_ch = self.input_channels
         state_a[:, :input_ch] = inputs_a[start_level][:, :input_ch]

@@ -2,6 +2,7 @@
 #python v_create_video_ioct2d_dual_view.py --random_word veneer --warm_m1init
 #
 import argparse
+import json
 import os
 
 import cv2
@@ -22,6 +23,32 @@ from train_ioct2d_dual_view_warm_preprocessed_m1init import (
 )
 from src.utils.ProjectConfiguration import ProjectConfiguration as pc
 import colormaps as cmaps
+
+
+def _preload_saved_config(study_config: dict) -> None:
+    """Merge the saved config.json into *study_config* so that (1) the model
+    is constructed with the same architecture that was used during training
+    and (2) reload() sees no mismatches, avoiding interactive prompts."""
+    model_path_base = os.path.join(
+        pc.FILER_BASE_PATH,
+        study_config.get(
+            "experiment.model_path",
+            os.path.join(
+                pc.STUDY_PATH,
+                "Experiments",
+                study_config["experiment.name"] + "_" + study_config["experiment.description"],
+            ),
+        ),
+    )
+    config_path = os.path.join(model_path_base, "config.json")
+    if not os.path.isfile(config_path):
+        return
+    with open(config_path, "r") as f:
+        saved = json.load(f)
+    # Merge all saved keys into the current config so Experiment.reload()
+    # finds no mismatches.  We intentionally re-apply our own overrides
+    # (e.g. use_wandb=False) after this call.
+    study_config.update(saved)
 
 
 def _extract_logits(output, output_channels):
@@ -148,6 +175,11 @@ def create_video_ioct2d_dual_view(
         dataset_args = get_dataset_args_dual(study_config)
         out_prefix = "long_ioct2d_dual"
 
+    # Pre-load the full saved config so the model is constructed with the
+    # correct architecture and Experiment.reload() sees no mismatches.
+    _preload_saved_config(study_config)
+
+    # Re-apply inference-time overrides after merging the saved config.
     study_config["experiment.use_wandb"] = False
     study_config["experiment.dataset.preload"] = False
 

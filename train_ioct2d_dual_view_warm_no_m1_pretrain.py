@@ -1,3 +1,26 @@
+"""Back-to-back dual-view warm-start training **without** any pretrained M1
+weights.  Both M1 and M2 are randomly initialised and trained jointly
+end-to-end.
+
+Key differences from ``train_ioct2d_dual_view_warm_preprocessed_m1init.py``:
+
+* ``model.m1.pretrained_path`` is empty  →  M1 starts from random init.
+* ``model.m1.freeze``  = False           →  M1 must learn, not be frozen.
+* ``model.m1.eval_mode`` = False         →  BN/dropout in train mode.
+* ``model.m1.use_t0_for_loss`` = True    →  direct supervision at t=0 so M1
+                                            gets gradient signal on the very
+                                            first frame.
+* ``model.m1.disable_backbone_tbptt`` = False  →  keep TBPTT active in M1
+                                                   since its backbone also
+                                                   trains.
+* ``model.m2.init_from_m1`` defaults to ``False``; setting it to ``True``
+  copies the *random* M1 weights into M2 so both branches share the same
+  starting point (only works when channel_n is the same for M1 and M2).
+* ``model.m1.channel_n`` is removed – M1 and M2 share the same channel
+  count since there is no legacy checkpoint to accommodate.
+* Learning rate defaults higher (``2e-4``) since we train from scratch.
+"""
+
 import configs
 from src.utils.ExperimentWrapper import ExperimentWrapper
 from src.losses.WeightedLosses import WeightedLosses
@@ -15,6 +38,9 @@ from src.datasets.Dataset_Base import Dataset_Base
 from src.utils.DistanceMaps import signed_distance_map
 
 
+# ---------------------------------------------------------------------------
+# Helper: normalise the sequence-level TBPTT mode string
+# ---------------------------------------------------------------------------
 def _normalize_seq_tbptt_mode(mode: str) -> str:
     mode = (mode or "").strip().lower()
     aliases = {
@@ -39,132 +65,123 @@ def _normalize_seq_tbptt_mode(mode: str) -> str:
     )
 
 
-# iOCT dataset root (contains peeling/ and sri/ subfolders)
+# ── Environment variables ──────────────────────────────────────────────────
 DATA_ROOT = "/vol/data/OctreeNCA_Video/ioct_data"
 
-# Optional: train only a subset of foreground classes (background 0 is always kept).
-# Example: [1, 2] -> model outputs 3 classes (background + 2 selected).
 SELECTED_CLASSES = None  # e.g. [1, 2]
 
-# Set this to a dual-view M1 checkpoint (.pth) or directory containing model.pth.
-M1_CHECKPOINT_PATH = os.getenv("IOCT_DUAL_WARM_M1_CHECKPOINT_PATH", "").strip()
+# No pretrained M1 path – this is the whole point of this script.
+M1_CHECKPOINT_PATH = os.getenv("IOCT_DUAL_B2B_M1_CHECKPOINT_PATH", "").strip()
 
-SEQUENCE_LENGTH = int(os.getenv("IOCT_DUAL_WARM_SEQUENCE_LENGTH", "3"))
-SEQUENCE_STEP = int(os.getenv("IOCT_DUAL_WARM_SEQUENCE_STEP", "1"))
+SEQUENCE_LENGTH = int(os.getenv("IOCT_DUAL_B2B_SEQUENCE_LENGTH", "3"))
+SEQUENCE_STEP = int(os.getenv("IOCT_DUAL_B2B_SEQUENCE_STEP", "1"))
 
-# --- Curriculum schedule on sequence length ---
-# The dataset loads sequences of SEQUENCE_LENGTH_MAX frames, but training
-# starts with SEQUENCE_LENGTH_MIN and linearly ramps up to SEQUENCE_LENGTH_MAX
-# over the first CURRICULUM_WARMUP_EPOCHS epochs.  This forces the model to
-# learn long-horizon stability gradually.
-SEQUENCE_LENGTH_MIN = int(os.getenv("IOCT_DUAL_WARM_SEQ_LEN_MIN", str(SEQUENCE_LENGTH)))
-SEQUENCE_LENGTH_MAX = int(os.getenv("IOCT_DUAL_WARM_SEQ_LEN_MAX", str(SEQUENCE_LENGTH)))
-CURRICULUM_WARMUP_EPOCHS = int(os.getenv("IOCT_DUAL_WARM_CURRICULUM_EPOCHS", "0"))
+# Curriculum schedule
+SEQUENCE_LENGTH_MIN = int(os.getenv("IOCT_DUAL_B2B_SEQ_LEN_MIN", str(SEQUENCE_LENGTH)))
+SEQUENCE_LENGTH_MAX = int(os.getenv("IOCT_DUAL_B2B_SEQ_LEN_MAX", str(SEQUENCE_LENGTH)))
+CURRICULUM_WARMUP_EPOCHS = int(os.getenv("IOCT_DUAL_B2B_CURRICULUM_EPOCHS", "0"))
 
-# --- Hidden-state noise injection (training only) ---
+# Hidden-state noise injection
 WARM_HIDDEN_NOISE_STD = os.getenv(
-    "IOCT_DUAL_WARM_HIDDEN_NOISE_STD", os.getenv("IOCT_WARM_HIDDEN_NOISE_STD", "")
+    "IOCT_DUAL_B2B_HIDDEN_NOISE_STD", os.getenv("IOCT_WARM_HIDDEN_NOISE_STD", "")
 ).strip()
 WARM_HIDDEN_NOISE_ANNEAL_EPOCHS = int(os.getenv(
-    "IOCT_DUAL_WARM_HIDDEN_NOISE_ANNEAL_EPOCHS",
+    "IOCT_DUAL_B2B_HIDDEN_NOISE_ANNEAL_EPOCHS",
     os.getenv("IOCT_WARM_HIDDEN_NOISE_ANNEAL_EPOCHS", "0"),
 ))
 
-# --- Spectral norm on NCA backbone residual layer ---
+# Spectral norm
 ENABLE_SPECTRAL_NORM = os.getenv(
-    "IOCT_DUAL_WARM_SPECTRAL_NORM", os.getenv("IOCT_WARM_SPECTRAL_NORM", "0")
+    "IOCT_DUAL_B2B_SPECTRAL_NORM", os.getenv("IOCT_WARM_SPECTRAL_NORM", "0")
 ) == "1"
 
-# --- Temporal consistency loss on hidden states ---
+# Temporal consistency loss
 TEMPORAL_CONSISTENCY_WEIGHT = os.getenv(
-    "IOCT_DUAL_WARM_TEMPORAL_CONSISTENCY_WEIGHT",
+    "IOCT_DUAL_B2B_TEMPORAL_CONSISTENCY_WEIGHT",
     os.getenv("IOCT_WARM_TEMPORAL_CONSISTENCY_WEIGHT", ""),
 ).strip()
 
-IOCT_M1_FREEZE = os.getenv("IOCT_M1_FREEZE", "0") == "1"
+# M1 settings – all default to "training" mode since there are no pretrained
+# weights.
+IOCT_M1_FREEZE = False  # NEVER freeze a random M1
 M1_DISABLE_BACKBONE_TBPTT = os.getenv(
-    "IOCT_DUAL_WARM_M1_DISABLE_BACKBONE_TBPTT",
-    os.getenv("IOCT_WARM_M1_DISABLE_BACKBONE_TBPTT", "1"),
-) == "1"
+    "IOCT_DUAL_B2B_M1_DISABLE_BACKBONE_TBPTT", "0"
+) == "1"  # default: keep TBPTT active in M1
 
 INIT_M2_FROM_M1 = os.getenv(
-    "IOCT_DUAL_WARM_INIT_M2_FROM_M1", os.getenv("IOCT_WARM_INIT_M2_FROM_M1", "1")
+    "IOCT_DUAL_B2B_INIT_M2_FROM_M1", os.getenv("IOCT_WARM_INIT_M2_FROM_M1", "0")
 ) == "1"
 INIT_M2_IDENTITY = os.getenv(
-    "IOCT_DUAL_WARM_INIT_M2_IDENTITY", os.getenv("IOCT_WARM_INIT_M2_IDENTITY", "0")
+    "IOCT_DUAL_B2B_INIT_M2_IDENTITY", os.getenv("IOCT_WARM_INIT_M2_IDENTITY", "0")
 ) == "1"
 SHARE_M1_M2_BACKBONE = os.getenv(
-    "IOCT_DUAL_WARM_SHARE_M1_M2_BACKBONE", os.getenv("IOCT_WARM_SHARE_M1_M2_BACKBONE", "0")
+    "IOCT_DUAL_B2B_SHARE_M1_M2_BACKBONE", os.getenv("IOCT_WARM_SHARE_M1_M2_BACKBONE", "0")
 ) == "1"
 _seq_tbptt_env = os.getenv(
-    "IOCT_DUAL_WARM_SEQ_TBPTT_STEPS",
+    "IOCT_DUAL_B2B_SEQ_TBPTT_STEPS",
     os.getenv("IOCT_WARM_SEQ_TBPTT_STEPS", os.getenv("IOCT_SEQ_TBPTT_STEPS", "")),
 ).strip()
 SEQUENCE_TBPTT_STEPS = int(_seq_tbptt_env) if _seq_tbptt_env else None
 _seq_tbptt_mode_env = os.getenv(
-    "IOCT_DUAL_WARM_SEQ_TBPTT_MODE",
+    "IOCT_DUAL_B2B_SEQ_TBPTT_MODE",
     os.getenv("IOCT_WARM_SEQ_TBPTT_MODE", os.getenv("IOCT_SEQ_TBPTT_MODE", "detach")),
 )
 SEQUENCE_TBPTT_MODE = _normalize_seq_tbptt_mode(_seq_tbptt_mode_env)
 
 WARM_MULTISCALE = os.getenv(
-    "IOCT_DUAL_WARM_MULTISCALE", os.getenv("IOCT_WARM_MULTISCALE", "0")
+    "IOCT_DUAL_B2B_MULTISCALE", os.getenv("IOCT_WARM_MULTISCALE", "0")
 ) == "1"
 WARM_MULTISCALE_START_LEVEL = os.getenv(
-    "IOCT_DUAL_WARM_MULTISCALE_START_LEVEL", os.getenv("IOCT_WARM_MULTISCALE_START_LEVEL", "")
+    "IOCT_DUAL_B2B_MULTISCALE_START_LEVEL", os.getenv("IOCT_WARM_MULTISCALE_START_LEVEL", "")
 ).strip()
 WARM_MULTISCALE_STEPS = os.getenv(
-    "IOCT_DUAL_WARM_MULTISCALE_STEPS", os.getenv("IOCT_WARM_MULTISCALE_STEPS", "")
+    "IOCT_DUAL_B2B_MULTISCALE_STEPS", os.getenv("IOCT_WARM_MULTISCALE_STEPS", "")
 ).strip()
 WARM_MULTISCALE_DOWNSAMPLE_MODE = os.getenv(
-    "IOCT_DUAL_WARM_MULTISCALE_DOWNSAMPLE_MODE",
+    "IOCT_DUAL_B2B_MULTISCALE_DOWNSAMPLE_MODE",
     os.getenv("IOCT_WARM_MULTISCALE_DOWNSAMPLE_MODE", "nearest"),
 ).strip()
 WARM_LOGITS_MODE = os.getenv(
-    "IOCT_DUAL_WARM_LOGITS_MODE", os.getenv("IOCT_WARM_LOGITS_MODE", "carry")
+    "IOCT_DUAL_B2B_LOGITS_MODE", os.getenv("IOCT_WARM_LOGITS_MODE", "carry")
 ).strip().lower()
 WARM_LOGITS_GATE_FROM = os.getenv(
-    "IOCT_DUAL_WARM_LOGITS_GATE_FROM", os.getenv("IOCT_WARM_LOGITS_GATE_FROM", "hidden")
+    "IOCT_DUAL_B2B_LOGITS_GATE_FROM", os.getenv("IOCT_WARM_LOGITS_GATE_FROM", "hidden")
 ).strip().lower()
 WARM_HIDDEN_NORM = os.getenv(
-    "IOCT_DUAL_WARM_HIDDEN_NORM", os.getenv("IOCT_WARM_HIDDEN_NORM", "none")
+    "IOCT_DUAL_B2B_HIDDEN_NORM", os.getenv("IOCT_WARM_HIDDEN_NORM", "none")
 ).strip().lower()
 WARM_HIDDEN_CLIP = os.getenv(
-    "IOCT_DUAL_WARM_HIDDEN_CLIP", os.getenv("IOCT_WARM_HIDDEN_CLIP", "")
+    "IOCT_DUAL_B2B_HIDDEN_CLIP", os.getenv("IOCT_WARM_HIDDEN_CLIP", "")
 ).strip()
 WARM_HIDDEN_TANH_SCALE = os.getenv(
-    "IOCT_DUAL_WARM_HIDDEN_TANH_SCALE", os.getenv("IOCT_WARM_HIDDEN_TANH_SCALE", "")
+    "IOCT_DUAL_B2B_HIDDEN_TANH_SCALE", os.getenv("IOCT_WARM_HIDDEN_TANH_SCALE", "")
 ).strip()
 WARM_HIDDEN_GN_GROUPS = os.getenv(
-    "IOCT_DUAL_WARM_HIDDEN_GN_GROUPS", os.getenv("IOCT_WARM_HIDDEN_GN_GROUPS", "")
+    "IOCT_DUAL_B2B_HIDDEN_GN_GROUPS", os.getenv("IOCT_WARM_HIDDEN_GN_GROUPS", "")
 ).strip()
 
-# --- Learned temporal gate on hidden channels ("none" or "gru") ---
+# Learned temporal gate
 WARM_TEMPORAL_GATE = os.getenv(
-    "IOCT_DUAL_WARM_TEMPORAL_GATE", os.getenv("IOCT_WARM_TEMPORAL_GATE", "none")
+    "IOCT_DUAL_B2B_TEMPORAL_GATE", os.getenv("IOCT_WARM_TEMPORAL_GATE", "none")
 ).strip().lower()
 
-# --- Temporal vs. Spatial hidden channel split ---
-# Fraction of hidden channels that are temporal (carried across frames).
-# The remaining hidden channels are spatial (reset to zero each frame).
-# Default "" means 1.0 (all temporal, legacy behaviour).
+# Temporal vs. Spatial hidden channel split
 WARM_TEMPORAL_RATIO = os.getenv(
-    "IOCT_DUAL_WARM_TEMPORAL_RATIO", os.getenv("IOCT_WARM_TEMPORAL_RATIO", "")
+    "IOCT_DUAL_B2B_TEMPORAL_RATIO", os.getenv("IOCT_WARM_TEMPORAL_RATIO", "")
 ).strip()
 
 # --- Number of NCA state channels ---
-CHANNEL_N = int(os.getenv("IOCT_DUAL_WARM_CHANNEL_N", os.getenv("IOCT_WARM_CHANNEL_N", "24")))
+CHANNEL_N = int(os.getenv("IOCT_DUAL_B2B_CHANNEL_N", os.getenv("IOCT_WARM_CHANNEL_N", "24")))
 
-# --- M1 channel count (defaults to CHANNEL_N; set separately when M1
-#     checkpoint was trained with a different channel count) ---
-M1_CHANNEL_N = os.getenv(
-    "IOCT_DUAL_WARM_M1_CHANNEL_N", os.getenv("IOCT_WARM_M1_CHANNEL_N", "")
-).strip()
+# No separate M1_CHANNEL_N – M1 and M2 share the same channel count.
 
 DATASETS = ["peeling", "sri"]
 VIEWS = ["A", "B"]
 
 
+# ---------------------------------------------------------------------------
+# Inverse-frequency class-weight computation (same as parent script)
+# ---------------------------------------------------------------------------
 def _compute_class_alpha_weights(
     data_root: str,
     datasets: list,
@@ -173,9 +190,6 @@ def _compute_class_alpha_weights(
     rgb_to_class: dict,
     max_samples: int = 200,
 ) -> list:
-    """Scan a subset of segmentation masks and return inverse-frequency alpha
-    weights suitable for FocalLoss.  Background (class 0) gets a small weight
-    so it doesn't dominate; rare foreground classes get upweighted."""
     from pathlib import Path
     counts = np.zeros(num_classes, dtype=np.float64)
     n_scanned = 0
@@ -204,55 +218,54 @@ def _compute_class_alpha_weights(
         if n_scanned >= max_samples:
             break
     print(f"Class pixel counts (from {n_scanned} samples): {counts}")
-    # Inverse frequency: alpha_c = total / (num_classes * count_c)
     total = counts.sum()
     alpha = np.where(counts > 0, total / (num_classes * counts), 1.0)
-    # Cap background weight to prevent it from dominating
     alpha[0] = min(alpha[0], 0.25)
-    # Normalize so mean of foreground alphas = 1.0
     fg_mean = alpha[1:].mean()
     if fg_mean > 0:
         alpha[1:] = alpha[1:] / fg_mean
     return alpha.tolist()
 
 
-# Torch compile controls for this training script.
+# ---------------------------------------------------------------------------
+# Torch compile
+# ---------------------------------------------------------------------------
 ENABLE_TORCH_COMPILE = os.getenv(
-    "IOCT_DUAL_WARM_TORCH_COMPILE",
+    "IOCT_DUAL_B2B_TORCH_COMPILE",
     os.getenv("IOCT_WARM_TORCH_COMPILE", os.getenv("IOCT_TORCH_COMPILE", "1")),
 ) == "1"
 TORCH_COMPILE_MODE = os.getenv(
-    "IOCT_DUAL_WARM_TORCH_COMPILE_MODE",
+    "IOCT_DUAL_B2B_TORCH_COMPILE_MODE",
     os.getenv("IOCT_WARM_TORCH_COMPILE_MODE", os.getenv("IOCT_TORCH_COMPILE_MODE", "max-autotune")),
 )
 TORCH_COMPILE_BACKEND = os.getenv(
-    "IOCT_DUAL_WARM_TORCH_COMPILE_BACKEND",
+    "IOCT_DUAL_B2B_TORCH_COMPILE_BACKEND",
     os.getenv("IOCT_WARM_TORCH_COMPILE_BACKEND", os.getenv("IOCT_TORCH_COMPILE_BACKEND", "inductor")),
 )
 TORCH_COMPILE_DYNAMIC = os.getenv(
-    "IOCT_DUAL_WARM_TORCH_COMPILE_DYNAMIC",
+    "IOCT_DUAL_B2B_TORCH_COMPILE_DYNAMIC",
     os.getenv("IOCT_WARM_TORCH_COMPILE_DYNAMIC", os.getenv("IOCT_TORCH_COMPILE_DYNAMIC", "0")),
 ) == "1"
 TORCH_COMPILE_FULLGRAPH = os.getenv(
-    "IOCT_DUAL_WARM_TORCH_COMPILE_FULLGRAPH",
+    "IOCT_DUAL_B2B_TORCH_COMPILE_FULLGRAPH",
     os.getenv("IOCT_WARM_TORCH_COMPILE_FULLGRAPH", os.getenv("IOCT_TORCH_COMPILE_FULLGRAPH", "0")),
 ) == "1"
 ENABLE_GRAD_NORM_LOGGING = os.getenv(
-    "IOCT_DUAL_WARM_TRACK_GRAD_NORM",
+    "IOCT_DUAL_B2B_TRACK_GRAD_NORM",
     os.getenv("IOCT_WARM_TRACK_GRAD_NORM", os.getenv("IOCT_TRACK_GRAD_NORM", "0")),
 ) == "1"
 _tbptt_env = os.getenv(
-    "IOCT_DUAL_WARM_TBPTT_STEPS",
+    "IOCT_DUAL_B2B_TBPTT_STEPS",
     os.getenv("IOCT_WARM_TBPTT_STEPS", os.getenv("IOCT_TBPTT_STEPS", "")),
 ).strip()
 BACKBONE_TBPTT_STEPS = int(_tbptt_env) if _tbptt_env else None
-LR_OVERRIDE = os.getenv("IOCT_DUAL_WARM_LR", os.getenv("IOCT_WARM_LR", "")).strip()
-LR_SCALE = float(os.getenv("IOCT_DUAL_WARM_LR_SCALE", os.getenv("IOCT_WARM_LR_SCALE", "1.0")))
+LR_OVERRIDE = os.getenv("IOCT_DUAL_B2B_LR", os.getenv("IOCT_WARM_LR", "")).strip()
+LR_SCALE = float(os.getenv("IOCT_DUAL_B2B_LR_SCALE", os.getenv("IOCT_WARM_LR_SCALE", "1.0")))
 RESUME_EXPERIMENT_NAME = os.getenv(
-    "IOCT_DUAL_WARM_RESUME_EXPERIMENT_NAME", os.getenv("IOCT_WARM_RESUME_EXPERIMENT_NAME", "")
+    "IOCT_DUAL_B2B_RESUME_EXPERIMENT_NAME", os.getenv("IOCT_WARM_RESUME_EXPERIMENT_NAME", "")
 ).strip()
 RESUME_MODEL_PATH = os.getenv(
-    "IOCT_DUAL_WARM_RESUME_MODEL_PATH", os.getenv("IOCT_WARM_RESUME_MODEL_PATH", "")
+    "IOCT_DUAL_B2B_RESUME_MODEL_PATH", os.getenv("IOCT_WARM_RESUME_MODEL_PATH", "")
 ).strip()
 
 
@@ -260,7 +273,10 @@ r = wonderwords.RandomWord()
 random_word = r.word(include_parts_of_speech=["nouns"])
 
 
-class EXP_OctreeNCA_DualView_WarmStart_M1Init(ExperimentWrapper):
+# ---------------------------------------------------------------------------
+# Experiment wrapper – identical to the m1-init variant
+# ---------------------------------------------------------------------------
+class EXP_OctreeNCA_DualView_B2B(ExperimentWrapper):
     def createExperiment(self, study_config: dict, detail_config: dict = {}, dataset_class=None, dataset_args=None):
         if dataset_args is None:
             dataset_args = {}
@@ -273,261 +289,15 @@ class EXP_OctreeNCA_DualView_WarmStart_M1Init(ExperimentWrapper):
         return super().createExperiment(study_config, model, agent, dataset_class, dataset_args, loss_function)
 
 
-class iOCTPairedSequentialDatasetForExperiment(Dataset_Base):
-    """
-    Paired-view sequential iOCT dataset adapter.
-
-    Returns:
-      - image_a, image_b: (T, 1, H, W)
-      - label_a, label_b: (T, C, H, W)
-    """
-
-    RGB_TO_CLASS = {
-        (0, 0, 0): 0,          # Background (black)
-        (255, 0, 0): 1,        # Class 1 (red)
-        (0, 255, 209): 2,      # Class 2 (cyan)
-        (61, 255, 0): 3,       # Class 3 (green)
-        (0, 78, 255): 4,       # Class 4 (blue)
-        (255, 189, 0): 5,      # Class 5 (yellow/orange)
-        (218, 0, 255): 6,      # Class 6 (magenta)
-    }
-
-    def __init__(
-        self,
-        data_root: str,
-        datasets=DATASETS,
-        views=VIEWS,
-        sequence_length: int = 3,
-        sequence_step: int = 1,
-        num_classes: int = 7,
-        input_size=(512, 512),
-        class_subset=None,
-        precompute_boundary_dist: bool = False,
-        boundary_dist_classes=None,
-        max_samples: int = None,
-    ):
-        super().__init__()
-        self.data_root = Path(data_root)
-        self.datasets = datasets
-        self.views = list(views)
-        if len(self.views) != 2:
-            raise ValueError(f"Expected exactly two views, got {self.views}.")
-        self.view_a, self.view_b = self.views[0], self.views[1]
-
-        self.sequence_length = int(sequence_length)
-        self.sequence_step = int(sequence_step)
-        self.num_classes = num_classes
-        self.size = input_size
-        self.precompute_boundary_dist = precompute_boundary_dist
-        self.boundary_dist_classes = boundary_dist_classes
-        self.max_samples = max_samples
-
-        # Required by agents
-        self.slice = -1
-        self.delivers_channel_axis = True
-        self.is_rgb = False
-
-        # Optional class subset selection
-        self.class_subset = None
-        self.class_map = None
-        if class_subset is not None:
-            cleaned = []
-            seen = set()
-            for c in class_subset:
-                c_int = int(c)
-                if c_int == 0:
-                    continue
-                if c_int not in seen:
-                    cleaned.append(c_int)
-                    seen.add(c_int)
-            if len(cleaned) == 0:
-                raise ValueError("class_subset must include at least one non-zero class id.")
-            self.class_subset = cleaned
-            self.class_map = {c: i + 1 for i, c in enumerate(self.class_subset)}
-            self.num_classes = len(self.class_subset) + 1
-
-        self.sequences = []
-        self.sequences_dict = {}
-        self._collect_sequences()
-
-    def _collect_sequences(self):
-        def _sort_key(name: str):
-            stem = Path(name).stem
-            try:
-                return (0, int(stem))
-            except ValueError:
-                return (1, stem)
-
-        required_span = (self.sequence_length - 1) * self.sequence_step + 1
-        for dataset_name in self.datasets:
-            base_path = self.data_root / dataset_name / "Bscans-dt"
-            img_dir_a = base_path / self.view_a / "Image"
-            seg_dir_a = base_path / self.view_a / "Segmentation"
-            img_dir_b = base_path / self.view_b / "Image"
-            seg_dir_b = base_path / self.view_b / "Segmentation"
-
-            if not (img_dir_a.exists() and seg_dir_a.exists() and img_dir_b.exists() and seg_dir_b.exists()):
-                print(
-                    f"Warning: Skipping {dataset_name} - paired sequence directories not found "
-                    f"({self.view_a}, {self.view_b})"
-                )
-                continue
-
-            names_a = {p.name for p in img_dir_a.glob("*.png") if (seg_dir_a / p.name).exists()}
-            names_b = {p.name for p in img_dir_b.glob("*.png") if (seg_dir_b / p.name).exists()}
-            common = sorted(names_a & names_b, key=_sort_key)
-
-            if len(common) < required_span:
-                continue
-
-            for i in range(0, len(common) - required_span + 1):
-                seq_names = [common[i + j * self.sequence_step] for j in range(self.sequence_length)]
-                seq_id = f"{dataset_name}_{Path(seq_names[0]).stem}"
-                info = {
-                    "id": seq_id,
-                    "patient_id": seq_id,
-                    "dataset": dataset_name,
-                    "view_a": self.view_a,
-                    "view_b": self.view_b,
-                    "seq_names": seq_names,
-                    "img_dir_a": img_dir_a,
-                    "seg_dir_a": seg_dir_a,
-                    "img_dir_b": img_dir_b,
-                    "seg_dir_b": seg_dir_b,
-                }
-                self.sequences.append(info)
-                self.sequences_dict[seq_id] = info
-
-        if self.max_samples is not None and self.max_samples > 0:
-            self.sequences = self.sequences[:self.max_samples]
-            self.sequences_dict = {s["id"]: s for s in self.sequences}
-
-        print(
-            f"Found {len(self.sequences)} paired iOCT sequences "
-            f"(views={self.view_a}+{self.view_b}, length={self.sequence_length}, step={self.sequence_step})."
-        )
-
-    def getFilesInPath(self, path: str):
-        return {k: {"id": k} for k in self.sequences_dict.keys()}
-
-    def setPaths(self, images_path: str, images_list: list, labels_path: str, labels_list: list) -> None:
-        super().setPaths(images_path, images_list, labels_path, labels_list)
-        self.sequences = [self.sequences_dict[uid] for uid in self.images_list if uid in self.sequences_dict]
-        print(f"Dataset split set. Active paired sequences: {len(self.sequences)}")
-
-    def _rgb_to_class(self, rgb_seg: np.ndarray) -> np.ndarray:
-        h, w = rgb_seg.shape[:2]
-        class_seg = np.zeros((h, w), dtype=np.int64)
-        for rgb_val, class_idx in self.RGB_TO_CLASS.items():
-            mask = (
-                (rgb_seg[:, :, 0] == rgb_val[0])
-                & (rgb_seg[:, :, 1] == rgb_val[1])
-                & (rgb_seg[:, :, 2] == rgb_val[2])
-            )
-            class_seg[mask] = class_idx
-        return class_seg
-
-    def __len__(self):
-        return len(self.sequences)
-
-    def _load_view_frame(self, img_path: Path, seg_path: Path):
-        img = np.array(Image.open(img_path))
-        seg_rgb = np.array(Image.open(seg_path))
-
-        if img.ndim == 3:
-            img = np.mean(img, axis=2).astype(np.uint8)
-
-        seg = self._rgb_to_class(seg_rgb)
-
-        expected_size = tuple(self.size)
-        if img.shape != expected_size:
-            raise ValueError(f"Image shape {img.shape} does not match expected size {expected_size} for {img_path}.")
-        if seg.shape != expected_size:
-            raise ValueError(
-                f"Segmentation shape {seg.shape} does not match expected size {expected_size} for {seg_path}."
-            )
-
-        if self.class_map is not None:
-            remapped = np.zeros_like(seg)
-            for src, dst in self.class_map.items():
-                remapped[seg == src] = dst
-            seg = remapped
-
-        img = img.astype(np.float32) / 255.0
-        img = img[None, :, :]  # (1, H, W)
-
-        seg_tensor = torch.from_numpy(seg).long()
-        max_class = int(seg_tensor.max().item())
-        if max_class >= self.num_classes:
-            raise ValueError(
-                f"Segmentation class id {max_class} is >= num_classes ({self.num_classes}). "
-                "Update model.output_channels or class_subset to cover all label ids."
-            )
-        label_onehot = (
-            torch.nn.functional.one_hot(seg_tensor, num_classes=self.num_classes)
-            .permute(2, 0, 1)
-            .numpy()
-            .astype(np.float32)
-        )
-
-        label_dist = None
-        if self.precompute_boundary_dist:
-            label_dist = signed_distance_map(
-                label_onehot,
-                class_ids=self.boundary_dist_classes,
-                channel_first=True,
-                compact=False,
-                dtype=np.float32,
-            )
-
-        return img, label_onehot, label_dist
-
-    def __getitem__(self, idx):
-        info = self.sequences[idx]
-
-        imgs_a, lbls_a = [], []
-        imgs_b, lbls_b = [], []
-        dists_a = [] if self.precompute_boundary_dist else None
-        dists_b = [] if self.precompute_boundary_dist else None
-
-        for name in info["seq_names"]:
-            img_a, lbl_a, dist_a = self._load_view_frame(info["img_dir_a"] / name, info["seg_dir_a"] / name)
-            img_b, lbl_b, dist_b = self._load_view_frame(info["img_dir_b"] / name, info["seg_dir_b"] / name)
-            imgs_a.append(img_a)
-            lbls_a.append(lbl_a)
-            imgs_b.append(img_b)
-            lbls_b.append(lbl_b)
-            if dists_a is not None:
-                dists_a.append(dist_a)
-            if dists_b is not None:
-                dists_b.append(dist_b)
-
-        sample = {
-            "image_a": np.stack(imgs_a),
-            "label_a": np.stack(lbls_a),
-            "image_b": np.stack(imgs_b),
-            "label_b": np.stack(lbls_b),
-            # Compatibility aliases for generic transform pipeline.
-            "image": np.stack(imgs_a),
-            "label": np.stack(lbls_a),
-            "id": info["id"],
-            "patient_id": info["patient_id"],
-            "dataset": info["dataset"],
-            "view_a": info["view_a"],
-            "view_b": info["view_b"],
-            "frame_start": Path(info["seq_names"][0]).stem,
-            "path_a": str(info["img_dir_a"] / info["seq_names"][0]),
-            "path_b": str(info["img_dir_b"] / info["seq_names"][0]),
-        }
-
-        if dists_a is not None:
-            sample["label_dist_a"] = np.stack(dists_a)
-            sample["label_dist"] = sample["label_dist_a"]
-        if dists_b is not None:
-            sample["label_dist_b"] = np.stack(dists_b)
-        return sample
+# ---------------------------------------------------------------------------
+# Dataset – re-use the paired-sequence dataset from the m1-init script
+# ---------------------------------------------------------------------------
+from train_ioct2d_dual_view_warm_preprocessed_m1init import iOCTPairedSequentialDatasetForExperiment
 
 
+# ---------------------------------------------------------------------------
+# Octree resolution builder
+# ---------------------------------------------------------------------------
 def _build_octree_resolutions(input_size, steps, final_steps, first_steps_multiplier=2):
     h, w = input_size
     resolutions = []
@@ -546,11 +316,16 @@ def _build_octree_resolutions(input_size, steps, final_steps, first_steps_multip
     return res_and_steps
 
 
+# ---------------------------------------------------------------------------
+# Study config
+# ---------------------------------------------------------------------------
 def get_study_config():
     full_num_classes = max(iOCTPairedSequentialDatasetForExperiment.RGB_TO_CLASS.values()) + 1
     study_config = {
-        "experiment.name": r"OctreeNCA_iOCT_2D_DualView_WarmStart_M1Init",
-        "experiment.description": "Dual-view warm start with M1 hidden state init on paired iOCT sequences.",
+        "experiment.name": r"OctreeNCA_iOCT_2D_DualView_B2B_NoM1Pretrain",
+        "experiment.description": (
+            "Back-to-back dual-view training: M1 + M2 from random init (no pretrained M1)."
+        ),
         "model.output_channels": full_num_classes,
         "model.input_channels": 1,
         "experiment.use_wandb": True,
@@ -599,22 +374,21 @@ def get_study_config():
     study_config["trainer.gradient_accumulation"] = 16
     study_config["trainer.normalize_gradients"] = "all"
 
-    # Dual-view cross-fusion settings.
+    # Dual-view cross-fusion settings
     study_config["model.dual_view.cross_fusion"] = "film"
     study_config["model.dual_view.cross_strength"] = 0.5
     study_config["model.dual_view.cross_use_tanh"] = True
 
-    # M1 init options
-    study_config["model.m1.pretrained_path"] = M1_CHECKPOINT_PATH
-    study_config["model.m1.freeze"] = IOCT_M1_FREEZE
-    if M1_CHANNEL_N != "":
-        study_config["model.m1.channel_n"] = int(M1_CHANNEL_N)
+    # ── M1 init: NO pretrained weights, train from scratch ──────────────
+    study_config["model.m1.pretrained_path"] = M1_CHECKPOINT_PATH  # empty → random init
+    study_config["model.m1.freeze"] = False   # must train M1
+    study_config["model.m1.eval_mode"] = False  # keep BN/dropout in train mode
     study_config["model.m1.use_first_frame"] = True
-    study_config["model.m1.use_t0_for_loss"] = False
+    study_config["model.m1.use_t0_for_loss"] = True  # supervise M1 at t=0
     study_config["model.m1.use_probs"] = False
     study_config["model.m1.disable_backbone_tbptt"] = M1_DISABLE_BACKBONE_TBPTT
 
-    # M2 init / weight sharing options
+    # M2 init / weight sharing  (no separate M1 channel count needed)
     study_config["model.m2.init_from_m1"] = INIT_M2_FROM_M1
     study_config["model.m2.init_identity"] = INIT_M2_IDENTITY
     study_config["model.m2.share_backbone_with_m1"] = SHARE_M1_M2_BACKBONE
@@ -641,12 +415,12 @@ def get_study_config():
     # Hidden-state stabilization
     study_config["model.octree.warm_start_hidden_norm"] = WARM_HIDDEN_NORM
 
-    # Hidden noise injection (scheduled sampling for hidden states)
+    # Hidden noise injection
     if WARM_HIDDEN_NOISE_STD != "":
         study_config["model.octree.warm_start_hidden_noise_std"] = float(WARM_HIDDEN_NOISE_STD)
     study_config["model.octree.warm_start_hidden_noise_anneal_epochs"] = WARM_HIDDEN_NOISE_ANNEAL_EPOCHS
 
-    # Spectral norm on NCA backbone
+    # Spectral norm
     study_config["model.spectral_norm"] = ENABLE_SPECTRAL_NORM
 
     # Temporal consistency loss
@@ -674,8 +448,7 @@ def get_study_config():
     dice_loss_weight = 1
     focal_loss_weight = 1
     boundary_loss_weight = 0.1
-    # EMA stores a full copy of model weights – disable to save ~50% param VRAM.
-    _ema_env = os.getenv("IOCT_DUAL_WARM_EMA", os.getenv("IOCT_WARM_EMA", "1"))
+    _ema_env = os.getenv("IOCT_DUAL_B2B_EMA", os.getenv("IOCT_WARM_EMA", "1"))
     ema_decay = 0.99 if _ema_env == "1" else 0.0
     study_config["trainer.ema"] = ema_decay > 0.0
     study_config["trainer.ema.decay"] = ema_decay
@@ -693,7 +466,6 @@ def get_study_config():
     print(f"Focal alpha (inverse-freq, normalized): {focal_alpha}")
 
     study_config["trainer.losses"] = [
-        # GeneralizedDiceLoss: built-in inverse-squared-volume class weights
         "src.losses.DiceLoss.GeneralizedDiceLoss",
         "src.losses.LossFunctions.FocalLoss",
         "src.losses.DiceLoss.BoundaryLoss",
@@ -733,9 +505,11 @@ def get_study_config():
     study_config["experiment.logging.track_gradient_norm"] = ENABLE_GRAD_NORM_LOGGING
     study_config["model.backbone.tbptt_steps"] = BACKBONE_TBPTT_STEPS
 
-    # Optional learning-rate controls for quick tuning without editing defaults.
+    # Higher default LR for training from scratch (2e-4 vs 1e-5 fine-tune).
     if LR_OVERRIDE != "":
         study_config["trainer.optimizer.lr"] = float(LR_OVERRIDE)
+    else:
+        study_config["trainer.optimizer.lr"] = 2e-4
     if LR_SCALE != 1.0:
         study_config["trainer.optimizer.lr"] = float(study_config["trainer.optimizer.lr"]) * LR_SCALE
 
@@ -761,7 +535,7 @@ def get_study_config():
     study_config["experiment.logging.phase_timing.print_interval"] = 20
     study_config["experiment.logging.phase_timing.warmup_steps"] = 5
 
-    # Optional class subset selection (foreground classes only; background is always class 0)
+    # Class subset
     selected_classes = SELECTED_CLASSES
     if selected_classes is not None:
         cleaned = []
@@ -785,7 +559,7 @@ def get_study_config():
         study_config["experiment.name"] = RESUME_EXPERIMENT_NAME
     else:
         study_config["experiment.name"] = (
-            f"WarmStart_M1Init_iOCT2D_dual_{random_word}_{study_config['model.channel_n']}"
+            f"B2B_NoM1Pretrain_iOCT2D_dual_{random_word}_{study_config['model.channel_n']}"
         )
 
     if RESUME_MODEL_PATH != "":
@@ -795,8 +569,6 @@ def get_study_config():
 
 
 def get_dataset_args(study_config):
-    # Use the maximum sequence length for the dataset so the agent can
-    # truncate dynamically via the curriculum schedule.
     dataset_seq_len = max(SEQUENCE_LENGTH, SEQUENCE_LENGTH_MAX)
     return {
         "data_root": DATA_ROOT,
@@ -830,11 +602,13 @@ if __name__ == "__main__":
             "optimizer_lr": study_config.get("trainer.optimizer.lr"),
             "lr_scale": LR_SCALE,
             "m1_checkpoint_path": study_config.get("model.m1.pretrained_path", ""),
+            "m1_freeze": study_config.get("model.m1.freeze", False),
+            "m1_use_t0_for_loss": study_config.get("model.m1.use_t0_for_loss", False),
         },
     )
 
     study = Study(study_config)
-    exp = EXP_OctreeNCA_DualView_WarmStart_M1Init().createExperiment(
+    exp = EXP_OctreeNCA_DualView_B2B().createExperiment(
         study_config,
         detail_config={},
         dataset_class=iOCTPairedSequentialDatasetForExperiment,

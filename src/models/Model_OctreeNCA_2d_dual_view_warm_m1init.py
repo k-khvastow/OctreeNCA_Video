@@ -20,18 +20,29 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
         super().__init__()
         self.config = config
 
-        self.m1 = OctreeNCA2DDualView(config)
+        # Allow M1 to use a different channel_n than M2 (e.g. when the M1
+        # checkpoint was trained with fewer channels).
+        m1_channel_n = config.get("model.m1.channel_n", None)
+        if m1_channel_n is not None:
+            m1_config = dict(config)
+            m1_config["model.channel_n"] = int(m1_channel_n)
+        else:
+            m1_config = config
+
+        self.m1 = OctreeNCA2DDualView(m1_config)
         self.m2 = OctreeNCA2DDualViewWarmStart(config)
 
         self.channel_n = self.m2.channel_n
         self.input_channels = self.m2.input_channels
         self.output_channels = self.m2.output_channels
+        self.m1_channel_n = self.m1.channel_n
 
         self.freeze_m1 = bool(config.get("model.m1.freeze", False))
         self.m1_use_probs = bool(config.get("model.m1.use_probs", False))
         self.m1_eval_mode = bool(config.get("model.m1.eval_mode", self.freeze_m1))
 
         self.m2_init_from_m1 = bool(config.get("model.m2.init_from_m1", False))
+        self.m2_init_identity = bool(config.get("model.m2.init_identity", False))
         self.m2_share_backbone_with_m1 = bool(config.get("model.m2.share_backbone_with_m1", False))
         self.m1_disable_backbone_tbptt = bool(config.get("model.m1.disable_backbone_tbptt", False))
 
@@ -40,11 +51,22 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
         self._apply_m1_freeze()
 
     def _sync_m2_from_m1(self) -> None:
-        if not self.m2_init_from_m1 and not self.m2_share_backbone_with_m1:
+        if not self.m2_init_from_m1 and not self.m2_share_backbone_with_m1 and not self.m2_init_identity:
             return
+
+        if self.m1_channel_n != self.channel_n:
+            raise ValueError(
+                f"Cannot sync M2 from M1 when channel counts differ "
+                f"(M1={self.m1_channel_n}, M2={self.channel_n}). "
+                f"Disable model.m2.init_from_m1 / share_backbone_with_m1 / init_identity, "
+                f"or set model.m1.channel_n to match model.channel_n."
+            )
 
         if self.m2_share_backbone_with_m1 and self.m2_init_from_m1:
             raise ValueError("Set only one of model.m2.init_from_m1 or model.m2.share_backbone_with_m1.")
+
+        if self.m2_init_identity and self.m2_share_backbone_with_m1:
+            raise ValueError("model.m2.init_identity is incompatible with model.m2.share_backbone_with_m1.")
 
         if getattr(self.m1, "separate_models", None) != getattr(self.m2, "separate_models", None):
             raise RuntimeError("M1 and M2 mismatch: separate_models differs.")
@@ -69,6 +91,40 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
             raise RuntimeError(
                 f"Unexpected keys while copying M1 -> M2: {copied.unexpected_keys}"
             )
+
+        if self.m2_init_identity:
+            self._reset_m2_residual_to_identity()
+
+    def _reset_m2_residual_to_identity(self) -> None:
+        """Zero-out M2 backbone residual layers so the NCA starts as identity.
+
+        After copying M1 weights to M2, M2 inherits M1's learned perception
+        pipeline (conv, fc0, bn) but produces zero residual updates (fc1 = 0).
+        This means M2 starts by perfectly passing through its input state and
+        gradually learns what temporal deltas to produce during training.
+
+        Also resets cross-view FiLM to identity (scale=0, shift=0).
+        """
+        with torch.no_grad():
+            for backbone in self._iter_backbone_modules(self.m2):
+                if hasattr(backbone, "fc1"):
+                    fc1 = backbone.fc1
+                    # Handle spectral-norm wrapped modules
+                    if hasattr(fc1, "parametrizations"):
+                        fc1.parametrizations.weight.original.zero_()
+                    elif hasattr(fc1, "weight"):
+                        fc1.weight.zero_()
+                    if hasattr(fc1, "bias") and fc1.bias is not None:
+                        fc1.bias.zero_()
+
+            # Reset cross-view FiLM to identity (scale=0, shift=0)
+            if getattr(self.m2, "cross_film", None) is not None:
+                for film_mlp in self.m2.cross_film:
+                    last_layer = film_mlp[-1]
+                    if hasattr(last_layer, "weight"):
+                        last_layer.weight.zero_()
+                    if hasattr(last_layer, "bias") and last_layer.bias is not None:
+                        last_layer.bias.zero_()
 
     def _resolve_m1_path(self, path: Optional[str]) -> Optional[str]:
         if path is None or path == "":
@@ -290,19 +346,21 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
             dtype=x_b_bhwc.dtype,
         )
 
-        expected_hidden = self.channel_n - self.input_channels - self.output_channels
-        if hidden_a.shape[-1] != expected_hidden or hidden_b.shape[-1] != expected_hidden:
-            raise RuntimeError(
-                f"M1 hidden_channels mismatch. Expected {expected_hidden}, got "
-                f"{hidden_a.shape[-1]} (A) and {hidden_b.shape[-1]} (B)."
-            )
+        m2_hidden_dim = self.channel_n - self.input_channels - self.output_channels
+        m1_hidden_dim = hidden_a.shape[-1]
+
+        # When M1 has fewer channels than M2, zero-pad the hidden state.
+        # When they match, this is a plain copy.
+        hidden_copy = min(m1_hidden_dim, m2_hidden_dim)
 
         state_a[..., :self.input_channels] = x_a_bhwc[..., :self.input_channels]
         state_b[..., :self.input_channels] = x_b_bhwc[..., :self.input_channels]
         state_a[..., self.input_channels:self.input_channels + self.output_channels] = logits_a
         state_b[..., self.input_channels:self.input_channels + self.output_channels] = logits_b
-        state_a[..., self.input_channels + self.output_channels:] = hidden_a
-        state_b[..., self.input_channels + self.output_channels:] = hidden_b
+        h_start = self.input_channels + self.output_channels
+        state_a[..., h_start:h_start + hidden_copy] = hidden_a[..., :hidden_copy]
+        state_b[..., h_start:h_start + hidden_copy] = hidden_b[..., :hidden_copy]
+        # Remaining channels (if M2 has more) stay zero-initialized.
         return state_a, state_b
 
     def m1_forward(
