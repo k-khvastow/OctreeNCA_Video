@@ -25,21 +25,27 @@ from src.utils.ProjectConfiguration import ProjectConfiguration as pc
 import colormaps as cmaps
 
 
-def _preload_saved_config(study_config: dict) -> None:
+def _preload_saved_config(study_config: dict, abs_model_dir: str = None) -> None:
     """Merge the saved config.json into *study_config* so that (1) the model
     is constructed with the same architecture that was used during training
-    and (2) reload() sees no mismatches, avoiding interactive prompts."""
-    model_path_base = os.path.join(
-        pc.FILER_BASE_PATH,
-        study_config.get(
-            "experiment.model_path",
-            os.path.join(
-                pc.STUDY_PATH,
-                "Experiments",
-                study_config["experiment.name"] + "_" + study_config["experiment.description"],
+    and (2) reload() sees no mismatches, avoiding interactive prompts.
+
+    If *abs_model_dir* is given it is used as-is (absolute path); otherwise
+    the directory is derived from FILER_BASE_PATH + experiment.model_path."""
+    if abs_model_dir is not None:
+        model_path_base = abs_model_dir
+    else:
+        model_path_base = os.path.join(
+            pc.FILER_BASE_PATH,
+            study_config.get(
+                "experiment.model_path",
+                os.path.join(
+                    pc.STUDY_PATH,
+                    "Experiments",
+                    study_config["experiment.name"] + "_" + study_config["experiment.description"],
+                ),
             ),
-        ),
-    )
+        )
     config_path = os.path.join(model_path_base, "config.json")
     if not os.path.isfile(config_path):
         return
@@ -157,6 +163,7 @@ def create_video_ioct2d_dual_view(
     warm_m1init=False,
     use_m1_init=True,
     render_t0_with_m1=True,
+    model_path=None,
 ):
     if warm_m1init:
         study_config = get_study_config_warm()
@@ -175,13 +182,24 @@ def create_video_ioct2d_dual_view(
         dataset_args = get_dataset_args_dual(study_config)
         out_prefix = "long_ioct2d_dual"
 
+    # If a direct model_path is given, resolve it to an absolute directory
+    # so we bypass the FILER_BASE_PATH prefix entirely.
+    abs_model_dir = None
+    if model_path is not None:
+        abs_model_dir = os.path.abspath(model_path)
+        study_config["experiment.model_path"] = model_path
+
     # Pre-load the full saved config so the model is constructed with the
     # correct architecture and Experiment.reload() sees no mismatches.
-    _preload_saved_config(study_config)
+    _preload_saved_config(study_config, abs_model_dir=abs_model_dir)
 
     # Re-apply inference-time overrides after merging the saved config.
     study_config["experiment.use_wandb"] = False
     study_config["experiment.dataset.preload"] = False
+    # Keep model_path pointing at the user-supplied directory after the
+    # config merge (which may have overwritten it with the saved value).
+    if abs_model_dir is not None:
+        study_config["experiment.model_path"] = model_path
 
     print("Initialize Experiment...")
     exp = exp_class().createExperiment(
@@ -191,7 +209,10 @@ def create_video_ioct2d_dual_view(
         dataset_args=dataset_args,
     )
 
-    model_dir = os.path.join(pc.FILER_BASE_PATH, exp.config["experiment.model_path"], "models")
+    if abs_model_dir is not None:
+        model_dir = os.path.join(abs_model_dir, "models")
+    else:
+        model_dir = os.path.join(pc.FILER_BASE_PATH, exp.config["experiment.model_path"], "models")
 
     if not os.path.exists(model_dir):
         print(f"Model directory not found: {model_dir}")
@@ -382,6 +403,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Only for --warm_m1init: render M2 output on first frame instead of M1 output.",
     )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help="Direct path to the experiment directory (relative to FILER_BASE_PATH). "
+             "Overrides the auto-constructed path from random_word + channel_n.",
+    )
     args = parser.parse_args()
 
     create_video_ioct2d_dual_view(
@@ -394,4 +422,5 @@ if __name__ == "__main__":
         warm_m1init=args.warm_m1init,
         use_m1_init=not args.no_m1_init,
         render_t0_with_m1=not args.m2_on_t0,
+        model_path=args.model_path,
     )
