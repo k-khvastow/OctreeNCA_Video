@@ -76,6 +76,11 @@ class Experiment():
             print("Warning: wandb not installed but use_wandb is True")
             self.use_wandb = False
         
+        # Buffer for batching wandb.log() calls so that wandb's internal
+        # _step counter increments once per flush (= once per training step),
+        # keeping it in sync with global_step.
+        self._wandb_log_buffer: dict = {}
+
         if self.use_wandb and self.currentStep == 0:
              self.init_wandb()
 
@@ -126,6 +131,11 @@ class Experiment():
             id=self.run.hash if self.run else None,
             resume="allow"
         )
+        # Use a custom X-axis so out-of-order step values (e.g. on resume) never
+        # trigger "Steps must be monotonically increasing" warnings.
+        # All log calls pass {"global_step": step, ...} instead of step= kwarg.
+        wandb.define_metric("global_step")
+        wandb.define_metric("*", step_metric="global_step")
 
     def new_datasplit(self) -> 'DataSplit':
         split_file = self.config.get('experiment.dataset.split_file', None)
@@ -482,6 +492,27 @@ class Experiment():
         r"""TODO: remove?"""
         return self.config
 
+    def flush_wandb(self) -> None:
+        """Flush the buffered wandb metrics in a single ``wandb.log()`` call.
+
+        This ensures wandb's internal ``_step`` counter increments exactly
+        once per flush, so it stays in sync with ``global_step``.
+        """
+        if self.use_wandb and self._wandb_log_buffer:
+            wandb.log(self._wandb_log_buffer)
+            self._wandb_log_buffer = {}
+
+    def _buffer_wandb(self, step: int, payload: dict) -> None:
+        """Merge *payload* into the wandb buffer under the given *step*."""
+        if not self.use_wandb:
+            return
+        # If the step changed, flush the previous batch first.
+        prev_step = self._wandb_log_buffer.get("global_step")
+        if prev_step is not None and prev_step != step:
+            self.flush_wandb()
+        self._wandb_log_buffer["global_step"] = step
+        self._wandb_log_buffer.update(payload)
+
     def write_scalar(self, tag: str, value: float, step: int) -> None:
         r"""Write scalars to tensorboard
         """
@@ -489,7 +520,7 @@ class Experiment():
         
         self.run.track(step=step, value=value, name=tag)
         if self.use_wandb:
-            wandb.log({tag: value}, step=step)
+            self._buffer_wandb(step, {tag: value})
 
     def write_img(self, tag: str, image: np.ndarray, step: int, context: dict = {}, normalize: bool = False) -> None:
         r"""Write an image to tensorboard
@@ -510,7 +541,7 @@ class Experiment():
         self.run.track(step=step, value=aim_image, name=tag, context=context)
         
         if self.use_wandb:
-            wandb.log({tag: wandb.Image(image, caption=tag)}, step=step)
+            self._buffer_wandb(step, {tag: wandb.Image(image, caption=tag)})
 
     def write_text(self, tag: str, text: str, step: int) -> None:
         r"""Write text to tensorboard
@@ -521,7 +552,7 @@ class Experiment():
         r"""Write data as histogram to tensorboard
         """
         if self.use_wandb:
-            wandb.log({tag: wandb.Histogram(data)}, step=step)
+            self._buffer_wandb(step, {tag: wandb.Histogram(data)})
 
         data = Distribution(data)
         self.run.track(step=step, value=data, name=tag)
@@ -541,7 +572,7 @@ class Experiment():
         """
         if self.use_wandb:
             img = self.fig2img(figure)
-            wandb.log({tag: wandb.Image(img)}, step=step)
+            self._buffer_wandb(step, {tag: wandb.Image(img)})
 
         figure = Figure(figure)
         self.run.track(step=step, value=figure, name=tag)
