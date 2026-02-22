@@ -113,6 +113,13 @@ def main():
         "model.m1.pretrained_path": study_config.get("model.m1.pretrained_path", ""),
         "model.m1.freeze": study_config.get("model.m1.freeze", None),
         "model.m1.use_t0_for_loss": study_config.get("model.m1.use_t0_for_loss", None),
+        "trainer.temporal_consistency_weight": study_config.get("trainer.temporal_consistency_weight", 0.0),
+        "trainer.contractive_weight": study_config.get("trainer.contractive_weight", 0.0),
+        "trainer.latent_sfa_weight": study_config.get("trainer.latent_sfa_weight", 0.0),
+        "trainer.latent_sfa_decorrelation_weight": study_config.get(
+            "trainer.latent_sfa_decorrelation_weight", 1.0
+        ),
+        "model.octree.res_and_steps": study_config.get("model.octree.res_and_steps"),
         "use_wandb": study_config.get("experiment.use_wandb", False),
     }
     print("\n" + "=" * 60)

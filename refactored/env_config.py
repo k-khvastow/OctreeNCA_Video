@@ -42,6 +42,17 @@ def _int_or_csv(val: str) -> int | list[int]:
     return int(val)
 
 
+def _int_or_range(val: str) -> int | tuple[int, int]:
+    """Parse '8' as int or '8,12' as (min, max) tuple for step ranges."""
+    val = val.strip()
+    if "," in val:
+        parts = [int(x) for x in val.split(",") if x.strip()]
+        if len(parts) != 2:
+            raise ValueError(f"Expected 'int' or 'min,max', got {val!r}")
+        return (parts[0], parts[1])
+    return int(val)
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Env var registry
 #
@@ -59,27 +70,51 @@ ENV_MAP: dict[str, tuple[str, Any]] = {
     "USE_WANDB":                    ("experiment.use_wandb", _bool),
 
     # ── Model architecture ───────────────────────────────────────────────
+    "NUM_LEVELS":                    ("model.octree.num_levels", int),
     "MODEL_CHANNEL_N":              ("model.channel_n", int),
     "MODEL_HIDDEN_SIZE":            ("model.hidden_size", int),
     "MODEL_M1_CHANNEL_N":           ("model.m1.channel_n", int),
     "MODEL_SPECTRAL_NORM":          ("model.spectral_norm", _bool),
     "MODEL_HIDDEN_NORM":            ("model.octree.warm_start_hidden_norm", str),
     "MODEL_HIDDEN_CLIP":            ("model.octree.warm_start_hidden_clip", float),
+    "MODEL_HIDDEN_NOISE_STD":       ("model.octree.warm_start_hidden_noise_std", float),
+    "MODEL_HIDDEN_NOISE_ANNEAL":    ("model.octree.warm_start_hidden_noise_anneal_epochs", int),
     "MODEL_HIDDEN_TANH_SCALE":      ("model.octree.warm_start_hidden_tanh_scale", float),
     "MODEL_HIDDEN_GN_GROUPS":       ("model.octree.warm_start_hidden_gn_groups", int),
+    "SEPARATE_MODELS":              ("model.octree.separate_models", _bool),
+    "BACKBONE_CLASS":               ("model.backbone_class", str),
     "MODEL_TEMPORAL_GATE":          ("model.octree.warm_start_temporal_gate", str),
     "MODEL_TEMPORAL_RATIO":         ("model.octree.warm_start_temporal_ratio", float),
     "MODEL_LOGITS_MODE":            ("model.octree.warm_start_logits_mode", str),
     "MODEL_LOGITS_GATE_FROM":       ("model.octree.warm_start_logits_gate_from", str),
+    "WARM_START_STEPS":             ("model.octree.warm_start_steps", int),
+    "FRAME_DIFF_INPUT":             ("model.octree.warm_start_frame_diff_input", _bool),
 
     # ── M1 / M2 relationship (dual-view only) ───────────────────────────
     "M1_CHECKPOINT":                ("model.m1.pretrained_path", str),
     "M1_FREEZE":                    ("model.m1.freeze", _bool),
+    "M1_EVAL_MODE":                 ("model.m1.eval_mode", _bool),
     "M1_LOSS_ON_T0":                ("model.m1.use_t0_for_loss", _bool),
     "M1_DISABLE_BACKBONE_TBPTT":    ("model.m1.disable_backbone_tbptt", _bool),
+    "M1_NUM_LEVELS":                ("model.m1.num_levels", int),
     "M2_INIT_FROM_M1":              ("model.m2.init_from_m1", _bool),
     "M2_IDENTITY_INIT":             ("model.m2.init_identity", _bool),
+    "M2_NUM_LEVELS":                ("model.m2.num_levels", int),
+    "M2_KERNEL_SIZE":               ("model.m2.kernel_size", int),
+    "M2_FC_BOTTLENECK":             ("model.m2.fc_bottleneck", int),
+    "M2_EXTRA_HIDDEN":              ("model.m2.extra_hidden", int),
+    "M2_HIDDEN_SIZE":               ("model.m2.hidden_size", int),
+    "M2_TEMPORAL_EMB_DIM":          ("model.m2.temporal_embed_dim", int),
+    "M2_WARP_LOGITS":               ("model.m2.warp_logits", _bool),
     "SHARE_M1_M2_BACKBONE":         ("model.m2.share_backbone_with_m1", _bool),
+
+    # ── Flow (optical-flow warp-then-refine M2) ─────────────────────────
+    "FLOW_ENABLED":                 ("model.flow.enabled", _bool),
+    "FLOW_LOSS_WEIGHT":             ("model.flow.loss_weight", float),
+    "FLOW_SMOOTHNESS_WEIGHT":       ("model.flow.smoothness_weight", float),
+    "FLOW_SSIM_WEIGHT":             ("model.flow.ssim_weight", float),
+    "FLOW_WARP_STATE":              ("model.flow.warp_state", _bool),
+    "FLOW_CONDITION_GATE":          ("model.flow.condition_gate", _bool),
 
     # ── Sequence / temporal ──────────────────────────────────────────────
     "SEQ_LENGTH":                   ("_seq.length", int),
@@ -91,8 +126,18 @@ ENV_MAP: dict[str, tuple[str, Any]] = {
     "CURRICULUM_MAX":               ("trainer.curriculum.seq_len_max", int),
     "CURRICULUM_EPOCHS":            ("trainer.curriculum.warmup_epochs", int),
     "TEMPORAL_CONSISTENCY_W":       ("trainer.temporal_consistency_weight", float),
+    "MOTION_LOSS_W":                ("trainer.motion_loss_weight", float),
+    "CONTRACTIVE_W":                ("trainer.contractive_weight", float),
+    "LATENT_SFA_W":                 ("trainer.latent_sfa_weight", float),
+    "LATENT_SFA_DECORR_W":          ("trainer.latent_sfa_decorrelation_weight", float),
     "HIDDEN_NOISE_STD":             ("model.octree.warm_start_hidden_noise_std", float),
     "HIDDEN_NOISE_ANNEAL":          ("model.octree.warm_start_hidden_noise_anneal_epochs", int),
+
+    # ── Octree step counts ──────────────────────────────────────────────
+    # Each accepts a single int (fixed) or "min,max" (random range during training).
+    "OCTREE_STEPS":                 ("model.octree.steps_per_level", _int_or_range),
+    "OCTREE_COARSEST_STEPS":        ("model.octree.coarsest_steps", _int_or_range),
+    "OCTREE_FINEST_MULTIPLIER":     ("model.octree.finest_multiplier", float),
 
     # ── Multiscale warm-start ────────────────────────────────────────────
     "MULTISCALE":                   ("model.octree.warm_start_multiscale", _bool),
@@ -164,7 +209,9 @@ def validate_env() -> list[str]:
                            "EXP_", "WANDB_", "USE_", "LR", "EMA", "TORCH_COMPILE",
                            "CURRICULUM_", "TEMPORAL_", "HIDDEN_", "MULTISCALE_",
                            "BACKBONE_", "GRADIENT_", "RESUME_", "SAVE_", "EVAL_",
-                           "TRACK_", "SHARE_", "BATCH_", "N_EPOCHS")):
+                           "TRACK_", "SHARE_", "BATCH_", "N_EPOCHS",
+                           "CONTRACTIVE_", "LATENT_", "NUM_", "OCTREE_",
+                           "WARM_START", "FLOW_", "FRAME_", "MOTION_")):
             if key not in known:
                 warnings.append(
                     f"  Warning: Env var '{key}' looks like a cockpit var but is not recognized. "
