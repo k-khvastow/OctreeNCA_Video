@@ -9,7 +9,6 @@ from train_baseline_unet import UNet, IOCTDataset
 
 # --- CONFIGURATION ---
 CONFIG = {
-    # Data Paths (Same as training)
     'data_path': 'ioct_data',      
    # 'label_path': 'ioct_data/peeling/Bscans-dt/A/Segmentation', 
     
