@@ -1,24 +1,21 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════
-# COCKPIT — iOCT Dual-View Fine-Tune (warm-start with pretrained M1)
+# COCKPIT — iOCT Dual-View Flow Fine-Tune (pretrained M1 + flow M2)
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# Equivalent to the old: script_train_dual_view_warm_tbptt.sh
-#                       + train_ioct2d_dual_view_warm_preprocessed_m1init.py
+# Flow-augmented warm-start with a FROZEN pretrained M1.
+# M1 initialises the recurrent state at t=0, then M2 (with optical-flow
+# warp-then-refine) rolls forward.
 #
 # Usage:
-#   chmod +x refactored/cockpit_ioct_finetune.sh
-#   ./refactored/cockpit_ioct_finetune.sh
-#
-# Or source it and run train.py manually:
-#   source refactored/cockpit_ioct_finetune.sh
-#   python refactored/train.py --dry-run
+#   chmod +x refactored/cockpit_flow_finetune.sh
+#   ./refactored/cockpit_flow_finetune.sh
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
 
 # ── Preset selection ─────────────────────────────────────────────────────
-export EXP_PRESET="ioct_dual_warm"
+export EXP_PRESET="ioct_dual_flow"
 
 # ── VRAM-saving tweaks (16 GB GPU) ──────────────────────────────────────
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -34,66 +31,52 @@ export MODEL_HIDDEN_CLIP="5.0"
 export WARM_START_STEPS="10"
 
 # ── Octree forward steps per resolution level ───────────────────────────
-# Each value is either a fixed int ("8") or a random range ("8,12").
-# During training, ranges are sampled uniformly; during eval, max is used.
-#   OCTREE_STEPS          — steps for middle + finest levels (finest = steps × multiplier)
-#   OCTREE_COARSEST_STEPS — steps for the coarsest level
-#   OCTREE_FINEST_MULTIPLIER — multiplier applied to OCTREE_STEPS for the finest level
 export OCTREE_STEPS="10"
-export OCTREE_COARSEST_STEPS="20"
+export OCTREE_COARSEST_STEPS="10"
 export OCTREE_FINEST_MULTIPLIER="1"
 export NUM_LEVELS="4"
 
-# ── M1 checkpoint (pretrained) ──────────────────────────────────────────
+# ── M1 checkpoint (pretrained, frozen) ──────────────────────────────────
 export M1_CHECKPOINT="/vol/data/OctreeNCA_Video/<path>/<path>/octree_study_new/Experiments/iOCT2D_dual_dispute_32_Dual-view iOCT (A+B) OctreeNCA segmentation./models/epoch_99/model.pth"
 export M1_FREEZE="1"
 export M1_EVAL_MODE="0"
 export M1_DISABLE_BACKBONE_TBPTT="1"
-# If M1 was trained with fewer octree levels (e.g. 3 instead of 5), set this:
 export M1_NUM_LEVELS="4"
+export M1_LOSS_ON_T0="0"
+
+# ── M2 configuration ────────────────────────────────────────────────────
+export M2_IDENTITY_INIT="0"
+export M2_INIT_FROM_M1="0"
+export M2_NUM_LEVELS="1"
+export SHARE_M1_M2_BACKBONE="0"
+
+# ── Flow settings ───────────────────────────────────────────────────────
+export FLOW_ENABLED="1"
+export FLOW_LOSS_WEIGHT="0.1"
+export FLOW_SMOOTHNESS_WEIGHT="0.01"
+export FLOW_SSIM_WEIGHT="0.0"
+export FLOW_WARP_STATE="1"
+export FLOW_CONDITION_GATE="0"
 
 # ── Sequence / TBPTT ────────────────────────────────────────────────────
-export SEQ_LENGTH="10"
-# SEQ_STEP controls the frame stride when building training sequences.
-# At high FPS the default of 1 (or even 10) produces near-identical consecutive
-# frames → M2 learns identity.  Increase until adjacent training frames show
-# visible mask displacement (try 15–30 for high-FPS iOCT).
+export SEQ_LENGTH="3"
 export SEQ_STEP="10"
 export TBPTT_MODE="chunked"
-export TBPTT_STEPS="3"
+export TBPTT_STEPS="2"
 export CURRICULUM_MIN="3"
-export CURRICULUM_MAX="10"
+export CURRICULUM_MAX="3"
 export CURRICULUM_EPOCHS="40"
 export TEMPORAL_CONSISTENCY_W="0"
 
-# ── Contractive regularization (Jacobian penalty on NCA update) ─────────
-# Set to 0 to disable. Typical values: 0.01 – 0.1
+# ── Contractive regularization ──────────────────────────────────────────
 export CONTRACTIVE_W="0"
 
-# ── Motion-weighted per-frame loss ──────────────────────────────────────
-# Upweights frames where the GT segmentation changes significantly between
-# consecutive steps: frame_weight = 1 + MOTION_LOSS_W * changed_pixel_fraction
-# This counteracts the identity attractor on high-FPS video where most
-# consecutive frames are very similar.  Start with 2–5; 0 = disabled.
-export MOTION_LOSS_W="3"
-
 # ── Latent Slow Feature Analysis (SFA) ──────────────────────────────────
-# L_sfa = ||h_t - h_{t-1}||^2 + (LATENT_SFA_DECORR_W * decorrelation(h_t))
-# Set LATENT_SFA_W=0 to disable.
 export LATENT_SFA_W="0"
 export LATENT_SFA_DECORR_W="0"
 
-# ── Hidden state ────────────────────────────────────────────────────────
-# Higher noise prevents M2 from coasting on a near-perfect carry-state and
-# forces it to learn segmentation from the image at each frame.
-export HIDDEN_NOISE_STD="0.05"
-
-# ── Frame-difference input channel for M2 ───────────────────────────────
-# When enabled, M2 receives an extra input channel containing the per-pixel
-# intensity difference (current − previous frame).  This gives the NCA an
-# explicit temporal-change signal without requiring hidden channels to
-# memorize raw pixel values.  Set to "0" to disable.
-export FRAME_DIFF_INPUT="1"
+# ── Hidden state noise ──────────────────────────────────────────────────
+export HIDDEN_NOISE_STD="0.01"
 
 # ── Training ────────────────────────────────────────────────────────────
 export LR="1e-4"
@@ -105,12 +88,6 @@ export GRADIENT_CLIP="1.0"
 # ── Tracking ────────────────────────────────────────────────────────────
 export USE_WANDB="1"
 export WANDB_PROJECT="OctreeNCA_Video"
-# ═══════════════════════════════════════════════════════════════════════════
-export M2_IDENTITY_INIT="0"
-export M2_INIT_FROM_M1="0"
-export M2_NUM_LEVELS="1"
-export SHARE_M1_M2_BACKBONE="0"
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Launch
