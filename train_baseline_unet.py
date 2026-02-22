@@ -8,16 +8,13 @@ import random
 #import copy
 from tqdm import tqdm
 import torch.nn.functional as F
+import wandb
 from PIL import Image
 from pathlib import Path
 
 
 class IOCTDataset(Dataset):
-    """
-    Standalone version of iOCTDatasetForExperiment.
-    Adapted to handle both 'Bscans-dt' structure and direct 'image' structure.
-    """
-    
+        
     # Mapping from RGB values to class indices
     RGB_TO_CLASS = {
         (0, 0, 0): 0,          # Background (black)
@@ -29,17 +26,14 @@ class IOCTDataset(Dataset):
         (218, 0, 255): 6,      # Class 6 (magenta)
     }
 
-    def __init__(self, data_root, input_size=(512, 512)):
+    def __init__(self, data_root, input_size=(512, 512), subset_videos=None):
         self.data_root = Path(data_root)
         self.input_size = input_size
+        self.num_classes = 7
+        self.subset_videos = subset_videos
         self.frames = []
-        self._collect_all_frames()
-        
-
-    def _collect_all_frames(self):
-        # Backwards-compatible name (some versions used `_collect_frames`).
-        self._collect_frames()
-
+        self._collect_frames_new()
+    # method for the first iOCT data (peeling/Bscans-dt and sri/Bscans-dt)
     def _collect_frames(self):
         datasets = ["peeling/Bscans-dt", "sri/Bscans-dt"]
         views = ["A", "B"]
@@ -70,6 +64,54 @@ class IOCTDataset(Dataset):
                         total_count += 1
                 
         print(f"Total frames collected: {total_count}")  
+    # method for the new iOCT data (peeling1, peeling2, peeling3)
+    def _collect_frames_new(self):
+        print(f"Scanning {self.data_root} for videos: {self.subset_videos}...")
+        
+        # Look for peeling1, peeling2, peeling3...
+        for video_folder in self.data_root.glob("peeling*"):
+            if not video_folder.is_dir(): continue
+            
+            video_id = video_folder.name # e.g. "peeling1"
+            
+            # Skip if this video is not in our requested subset
+            if self.subset_videos is not None and video_id not in self.subset_videos:
+                continue
+                
+            bscan_dir = video_folder / "iOCT" / "Bscan"
+            if not bscan_dir.exists():
+                print(f"  Warning: No iOCT/Bscan folder found in {video_id}")
+                continue
+            
+            # Iterate through frame indices (005, 006, etc.)
+            count = 0
+            for frame_folder in bscan_dir.iterdir():
+                if not frame_folder.is_dir(): continue
+                
+                # Check View 00
+                img_00 = frame_folder / "00.png"
+                seg_00 = frame_folder / "00_seg.png"
+                if img_00.exists() and seg_00.exists():
+                    self.frames.append({
+                        'image_path': str(img_00),
+                        'mask_path': str(seg_00),
+                        'video_id': video_id
+                    })
+                    count += 1
+                
+                # Check View 01
+                img_01 = frame_folder / "01.png"
+                seg_01 = frame_folder / "01_seg.png"
+                if img_01.exists() and seg_01.exists():
+                    self.frames.append({
+                        'image_path': str(img_01),
+                        'mask_path': str(seg_01),
+                        'video_id': video_id
+                    })
+                    count += 1
+                    
+            if count > 0:
+                print(f"  -> Loaded {count} frames from {video_id}")
 
     def _rgb_to_class(self, rgb_seg: np.ndarray) -> np.ndarray:
         h, w = rgb_seg.shape[:2]
@@ -90,7 +132,7 @@ class IOCTDataset(Dataset):
 
         # Load
         img_pil = Image.open(info['image_path']).convert("RGB") # Ensure 3 channels to start
-        mask_pil = Image.open(info['mask_path']).convert("RGB")
+        mask_pil = Image.open(info['mask_path']).convert('L')#.convert("RGB")
         
         # Resize
         if self.input_size:
@@ -100,14 +142,18 @@ class IOCTDataset(Dataset):
             mask_pil = mask_pil.resize(target_wh, Image.NEAREST)
 
         img = np.array(img_pil)
-        mask_rgb = np.array(mask_pil)
+        #mask_rgb = np.array(mask_pil)
+        mask_arr = np.array(mask_pil)
+        mask_arr[mask_arr >= 5] = 0 
 
         img_gray = np.mean(img, axis=2).astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_gray).unsqueeze(0).float() # (1, H, W)
 
         # Convert Mask RGB to Indices (H, W)
-        mask_indices = self._rgb_to_class(mask_rgb)
-        mask_tensor = torch.from_numpy(mask_indices).long()
+        #mask_indices = self._rgb_to_class(mask_rgb)
+        #mask_tensor = torch.from_numpy(mask_indices).long()
+
+        mask_tensor = torch.from_numpy(mask_arr.astype(np.int64)).long()
 
         return img_tensor, mask_tensor
 
@@ -181,11 +227,15 @@ class UNet(nn.Module):
         return logits
 
 CONFIG = {
-    'project_name': 'iOCT_UNet',
-    'run_name': 'Run_Mixed_Split_10Ep',
-    'data_path': 'ioct_data',  
-    'model_save_path': 'Models/iOCT_UNet',
+    'project_name': 'iOCT_UNet_new',
+    'run_name': 'train_peeling1_test_2_3',
+    'data_path': '/vol/data/BioProject13/data_OCT',  
+    'model_save_path': '/vol/data/OctreeNCA_Video/Models/iOCT_UNet_newdata',
     
+    'train_video': ['peeling1'],
+    'test_videos': ['peeling2', 'peeling3'],
+    'val_split_ratio': 0.15,
+
     'seed': 42,
     'batch_size': 8,
     'learning_rate': 1e-4,
@@ -195,10 +245,10 @@ CONFIG = {
     
     'input_channels': 1,  # Grayscale
     'base_channels': 32,
-    'n_classes': 7        
+    'n_classes': 5       
 }
 
-
+# mixed split of data for the first iOCT dataset (peeling/Bscans-dt and sri/Bscans-dt)
 def get_mixed_splits(config):
     """
     Mixes ALL data and splits randomly (80% Train, 10% Val, 10% Test).
@@ -229,6 +279,42 @@ def get_mixed_splits(config):
         [train_size, val_size, test_size],
         generator=generator
     )
+    
+    return train_ds, val_ds, test_ds
+# cross-validation split by video for the new iOCT dataset (peeling1, peeling2, peeling3)
+def get_crossval_splits(config):
+    print("\n" + "="*40)
+    print(f"CROSS VALIDATION SETUP")
+    print(f"Training on: {config['train_video']}")
+    print(f"Testing on:  {config['test_videos']}")
+    print("="*40)
+    
+    # 1. TEST SET (Strictly unseen videos)
+    test_ds = IOCTDataset(config['data_path'], config['input_size'], subset_videos=config['test_videos'])
+    if len(test_ds) == 0:
+        raise ValueError("Test dataset is empty! Check folder names and paths.")
+
+    # 2. TRAIN & VAL SETS (From the single training video)
+    full_train_video_ds = IOCTDataset(config['data_path'], config['input_size'], subset_videos=config['train_video'])
+    if len(full_train_video_ds) == 0:
+        raise ValueError("Train dataset is empty! Check folder names and paths.")
+        
+    # Split the single video into Train and Val
+    total_train_frames = len(full_train_video_ds)
+    val_size = int(total_train_frames * config['val_split_ratio'])
+    train_size = total_train_frames - val_size
+    
+    generator = torch.Generator().manual_seed(config['seed'])
+    train_ds, val_ds = random_split(
+        full_train_video_ds, 
+        [train_size, val_size],
+        generator=generator
+    )
+    
+    print("\nDataset Sizes:")
+    print(f"  Train: {len(train_ds)} frames (from {config['train_video']})")
+    print(f"  Val:   {len(val_ds)} frames (from {config['train_video']} - used for Model Selection)")
+    print(f"  Test:  {len(test_ds)} frames (from {config['test_videos']} - STRICTLY UNSEEN)")
     
     return train_ds, val_ds, test_ds
 
@@ -300,18 +386,12 @@ def run_validation(model, val_loader, criterion, device, num_classes, max_batche
 def run():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(CONFIG['model_save_path'], exist_ok=True)
-    try:
-        import wandb  # type: ignore
-    except ImportError as e:
-        raise ImportError(
-            "wandb is required to run training. Install it (e.g. `pip install wandb`) "
-            "or modify train_baseline_unet.py to disable wandb logging."
-        ) from e
+
 
     wandb.init(project=CONFIG['project_name'], config=CONFIG, name=CONFIG['run_name'])
     
     # 1. Data
-    train_ds, val_ds, test_ds = get_mixed_splits(CONFIG)
+    train_ds, val_ds, test_ds = get_crossval_splits(CONFIG)
     
     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=4)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2)
@@ -443,7 +523,8 @@ def run():
 
     print(f"Overall Test Dice: {total_dice / len(test_loader):.4f}")
     print("Per-Class Scores:")
-    class_names = ["Background", "Red", "Cyan", "Green", "Blue", "Yellow"]
+    #class_names = ["Background", "Red", "Cyan", "Green", "Blue", "Yellow"]
+    class_names = ["Background", "Class1", "Class2", "Class3", "Class4"]
     avg_class_dice = class_dice_sums / len(test_loader)
     
     for i, name in enumerate(class_names):
