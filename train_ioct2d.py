@@ -225,7 +225,7 @@ class iOCTDatasetForExperiment(Dataset_Base):
 def _build_octree_resolutions(input_size, steps, final_steps):
     h, w = input_size
     resolutions = []
-    for _ in range(5):
+    for _ in range(3):
         resolutions.append([h, w])
         h = max(1, h // 2)
         w = max(1, w // 2)

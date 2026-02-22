@@ -26,10 +26,16 @@ DATASETS = ["peeling", "sri"]
 VIEWS = ["A", "B"]
 
 # Torch compile controls for this training script.
-ENABLE_TORCH_COMPILE = os.getenv("IOCT_TORCH_COMPILE", "1") == "1"
-TORCH_COMPILE_MODE = os.getenv("IOCT_TORCH_COMPILE_MODE", "max-autotune")
+ENABLE_TORCH_COMPILE = os.getenv("IOCT_TORCH_COMPILE", "0") == "1"
+TORCH_COMPILE_MODE = os.getenv("IOCT_TORCH_COMPILE_MODE", "reduce-overhead") # default to "reduce-overhead" for faster iteration; "max-autotune" may yield better final performance but longer startup time
 TORCH_COMPILE_BACKEND = os.getenv("IOCT_TORCH_COMPILE_BACKEND", "inductor")
 TORCH_COMPILE_DYNAMIC = os.getenv("IOCT_TORCH_COMPILE_DYNAMIC", "0") == "1"
+
+# Random step counts × multiple resolutions can exceed the default dynamo cache
+# limit of 8 (e.g. 5 step values × 3 resolutions = 15 graphs).  Raise it so all
+# variants are cached after the initial warm-up instead of falling back to eager.
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
 TORCH_COMPILE_FULLGRAPH = os.getenv("IOCT_TORCH_COMPILE_FULLGRAPH", "0") == "1"
 ENABLE_GRAD_NORM_LOGGING = os.getenv("IOCT_TRACK_GRAD_NORM", "0") == "1"
 _tbptt_env = os.getenv("IOCT_TBPTT_STEPS", "").strip()
@@ -267,9 +273,16 @@ class iOCTPairedViewsDatasetForExperiment(Dataset_Base):
 
 
 def _build_octree_resolutions(input_size, steps, final_steps):
+    """Build octree resolution/step pairs.
+
+    ``steps`` and ``final_steps`` can each be:
+    * an ``int``  – fixed step count (backward compatible).
+    * a ``(min, max)`` tuple/list – step count will be sampled uniformly
+      from ``[min, max]`` during training (eval always uses *max*).
+    """
     h, w = input_size
     resolutions = []
-    for _ in range(5):
+    for _ in range(4):
         resolutions.append([h, w])
         h = max(1, h // 2)
         w = max(1, w // 2)
@@ -317,16 +330,20 @@ def get_study_config():
     study_config["trainer.n_epochs"] = 100
 
     # OctreeNCA Model specifics
-    steps = 10
+    # Steps can be an int (fixed) or a (min, max) tuple for random sampling.
+    steps = (10, 20)       # uniformly sample from [8, 12] during training
     alpha = 1.0
+    final_steps = (int(alpha * 15), int(alpha * 20))  # range for finest scale (capped at prev fixed value)
     input_size = study_config["experiment.dataset.input_size"]
-    study_config["model.octree.res_and_steps"] = _build_octree_resolutions(input_size, steps, int(alpha * 20))
-    study_config["model.kernel_size"] = [3] * len(study_config["model.octree.res_and_steps"])
+    study_config["model.octree.res_and_steps"] = _build_octree_resolutions(input_size, steps, final_steps)
+    # kernel_size must be a list when separate_models=True (one per level),
+    # but a plain int when separate_models=False.
+    study_config["model.kernel_size"] = 3
 
-    study_config["model.channel_n"] = 24
+    study_config["model.channel_n"] = 32
     study_config["model.hidden_size"] = 64
-    study_config["trainer.batch_size"] = 4
-    study_config["model.octree.separate_models"] = True
+    study_config["trainer.batch_size"] = 2
+    study_config["model.octree.separate_models"] = False
     study_config["model.backbone_class"] = "BasicNCA2DFast"
 
     # Dual-view fusion settings (keeps images separate; fuses via hidden-state FiLM).
