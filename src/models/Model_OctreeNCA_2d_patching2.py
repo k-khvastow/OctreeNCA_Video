@@ -201,9 +201,26 @@ class OctreeNCA2DPatch2(torch.nn.Module):
     def _get_backbone_for_level(self, level: int) -> nn.Module:
         return self.backbone_ncas[level] if self.separate_models else self.backbone_nca
 
+    def _resolve_steps(self, level: int) -> int:
+        """Return the number of NCA steps for *level*.
+
+        ``self.inference_steps[level]`` may be:
+        * an ``int``  – used as-is (backward compatible).
+        * a ``(min, max)`` tuple/list – during **training** the step count is
+          sampled uniformly from ``[min, max]``; during **eval** the *max* value
+          is used deterministically.
+        """
+        spec = self.inference_steps[level]
+        if isinstance(spec, (list, tuple)):
+            lo, hi = int(spec[0]), int(spec[1])
+            if self.training:
+                return random.randint(lo, hi)
+            return hi
+        return int(spec)
+
     def _run_backbone(self, x_bchw: torch.Tensor, level: int, visualize: bool = False):
         model = self._get_backbone_for_level(level)
-        steps = self.inference_steps[level]
+        steps = self._resolve_steps(level)
         kwargs = {"steps": steps, "fire_rate": self.fire_rate}
         if visualize:
             kwargs["visualize"] = True

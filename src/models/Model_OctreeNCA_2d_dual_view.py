@@ -21,6 +21,11 @@ class OctreeNCA2DDualView(OctreeNCA2DPatch2):
         self.cross_strength = float(config.get("model.dual_view.cross_strength", 0.5))
         self.cross_use_tanh = bool(config.get("model.dual_view.cross_use_tanh", True))
 
+        # Optional: capture intermediate octree level states for transfer to M2.
+        # Set to an int level index by the M2 wrapper to record hidden/logits
+        # at that level during forward_train.  None = disabled (default).
+        self._capture_level: int | None = None
+
         hidden_start = self.input_channels + self.output_channels
         hidden_dim = max(0, self.channel_n - hidden_start)
         self._dual_hidden_start = hidden_start
@@ -114,6 +119,8 @@ class OctreeNCA2DDualView(OctreeNCA2DPatch2):
         state_a[:, :input_ch] = xa_coarse[:, :input_ch]
         state_b[:, :input_ch] = xb_coarse[:, :input_ch]
 
+        _captured_level_states = None
+
         for level in range(len(self.octree_res) - 1, -1, -1):
             # NOTE: When the backbone is wrapped by `torch.compile()` with CUDA graphs,
             # sequential invocations can return tensors backed by the same internal
@@ -125,6 +132,17 @@ class OctreeNCA2DDualView(OctreeNCA2DPatch2):
             state_ab = self._run_backbone(state_ab, level)
             state_a, state_b = state_ab.chunk(2, dim=0)
             state_a, state_b = self._maybe_cross_fuse(state_a, state_b, level)
+
+            # Capture states at this level if requested (for M2 hidden transfer).
+            # Kept in BCHW to avoid unnecessary permute+contiguous copies;
+            # _states_from_m1_output handles interpolation directly in BCHW.
+            if self._capture_level is not None and self._capture_level == level:
+                _hs = input_ch + self.output_channels
+                _captured_level_states = {
+                    "hidden_a": state_a[:, _hs:].clone(),
+                    "hidden_b": state_b[:, _hs:].clone(),
+                    "_layout": "BCHW",
+                }
 
             if level > 0:
                 scale_h, scale_w = self.computed_upsampling_scales[level - 1][0]
@@ -157,6 +175,8 @@ class OctreeNCA2DDualView(OctreeNCA2DPatch2):
         ret_dict = {"logits": logits, "target": target, "hidden_channels": hidden}
         if self.apply_nonlin is not None:
             ret_dict["probabilities"] = self.apply_nonlin(logits)
+        if self._capture_level is not None and _captured_level_states is not None:
+            ret_dict["captured_level_states"] = _captured_level_states
         return ret_dict
 
     @torch.no_grad()

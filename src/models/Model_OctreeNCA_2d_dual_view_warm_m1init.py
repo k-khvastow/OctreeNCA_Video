@@ -23,14 +23,63 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
         # Allow M1 to use a different channel_n than M2 (e.g. when the M1
         # checkpoint was trained with fewer channels).
         m1_channel_n = config.get("model.m1.channel_n", None)
-        if m1_channel_n is not None:
+        m1_num_levels = config.get("model.m1.num_levels", None)
+
+        # Build a separate config for M1 if any architecture parameter differs.
+        need_m1_config = m1_channel_n is not None or m1_num_levels is not None
+        if need_m1_config:
             m1_config = dict(config)
-            m1_config["model.channel_n"] = int(m1_channel_n)
+            if m1_channel_n is not None:
+                m1_config["model.channel_n"] = int(m1_channel_n)
+            if m1_num_levels is not None:
+                # Truncate the shared res_and_steps to match the M1 checkpoint
+                # (e.g. checkpoint trained with 3 levels instead of 5).
+                full_res = config["model.octree.res_and_steps"]
+                m1_levels = int(m1_num_levels)
+                if m1_levels < 1 or m1_levels > len(full_res):
+                    raise ValueError(
+                        f"model.m1.num_levels={m1_levels} out of range "
+                        f"(1..{len(full_res)})."
+                    )
+                m1_config["model.octree.res_and_steps"] = full_res[:m1_levels]
+                # Also truncate kernel_size if it's a per-level list.
+                ks = m1_config.get("model.kernel_size", None)
+                if isinstance(ks, (list, tuple)) and len(ks) > m1_levels:
+                    m1_config["model.kernel_size"] = list(ks)[:m1_levels]
+                # Truncate per-level patch_sizes if present.
+                ps = m1_config.get("model.train.patch_sizes", None)
+                if isinstance(ps, (list, tuple)) and len(ps) > m1_levels:
+                    m1_config["model.train.patch_sizes"] = list(ps)[:m1_levels]
         else:
             m1_config = config
 
         self.m1 = OctreeNCA2DDualView(m1_config)
-        self.m2 = OctreeNCA2DDualViewWarmStart(config)
+
+        # Allow M2 to use fewer octree levels than the full config
+        # (e.g. 1 level for warm-start which only uses the finest resolution).
+        m2_num_levels = config.get("model.m2.num_levels", None)
+        if m2_num_levels is not None:
+            m2_config = dict(config)
+            full_res = config["model.octree.res_and_steps"]
+            m2_levels = int(m2_num_levels)
+            if m2_levels < 1 or m2_levels > len(full_res):
+                raise ValueError(
+                    f"model.m2.num_levels={m2_levels} out of range "
+                    f"(1..{len(full_res)})."
+                )
+            m2_config["model.octree.res_and_steps"] = full_res[:m2_levels]
+            # Also truncate kernel_size if it's a per-level list.
+            ks = m2_config.get("model.kernel_size", None)
+            if isinstance(ks, (list, tuple)) and len(ks) > m2_levels:
+                m2_config["model.kernel_size"] = list(ks)[:m2_levels]
+            # Truncate per-level patch_sizes if present.
+            ps = m2_config.get("model.train.patch_sizes", None)
+            if isinstance(ps, (list, tuple)) and len(ps) > m2_levels:
+                m2_config["model.train.patch_sizes"] = list(ps)[:m2_levels]
+        else:
+            m2_config = config
+
+        self.m2 = OctreeNCA2DDualViewWarmStart(m2_config)
 
         self.channel_n = self.m2.channel_n
         self.input_channels = self.m2.input_channels
@@ -85,12 +134,14 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
                 self.m2.cross_film = self.m1.cross_film
             return
 
+        m1_state = self.m1.state_dict()
+        m2_keys = set(self.m2.state_dict().keys())
+        # Filter M1's state dict to only include keys that M2 expects.
+        # This handles the case where M1 has more octree levels (and thus
+        # more per-level modules like cross_film) than M2.
+        filtered_state = {k: v for k, v in m1_state.items() if k in m2_keys}
         with torch.no_grad():
-            copied = self.m2.load_state_dict(self.m1.state_dict(), strict=False)
-        if len(copied.unexpected_keys) > 0:
-            raise RuntimeError(
-                f"Unexpected keys while copying M1 -> M2: {copied.unexpected_keys}"
-            )
+            copied = self.m2.load_state_dict(filtered_state, strict=False)
 
         if self.m2_init_identity:
             self._reset_m2_residual_to_identity()
@@ -353,8 +404,16 @@ class OctreeNCA2DDualViewWarmStartM1Init(nn.Module):
         # When they match, this is a plain copy.
         hidden_copy = min(m1_hidden_dim, m2_hidden_dim)
 
-        state_a[..., :self.input_channels] = x_a_bhwc[..., :self.input_channels]
-        state_b[..., :self.input_channels] = x_b_bhwc[..., :self.input_channels]
+        # M2 may have more input channels than the dataset image (e.g. when
+        # frame_diff_input is enabled, M2.input_channels = orig + 1).
+        # Only copy the original image channels; any extra input channels
+        # (like the frame-diff channel) stay zero for the first frame.
+        orig_ic = getattr(self.m2, "_orig_input_channels", self.input_channels)
+        state_a[..., :orig_ic] = x_a_bhwc[..., :orig_ic]
+        state_b[..., :orig_ic] = x_b_bhwc[..., :orig_ic]
+        # Extra input channels (e.g. frame-diff) remain zero-initialized,
+        # which correctly signals "no previous frame" at t=0.
+
         state_a[..., self.input_channels:self.input_channels + self.output_channels] = logits_a
         state_b[..., self.input_channels:self.input_channels + self.output_channels] = logits_b
         h_start = self.input_channels + self.output_channels

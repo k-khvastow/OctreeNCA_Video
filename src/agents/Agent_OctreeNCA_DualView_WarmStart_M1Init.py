@@ -6,6 +6,8 @@ import warnings
 
 from src.agents.Agent_MedNCA_Simple import MedNCAAgent
 from src.losses.TemporalConsistencyLoss import TemporalConsistencyLoss
+from src.losses.ContractiveRegularization import ContractiveRegularization
+from src.losses.LatentSlowFeatureLoss import LatentSlowFeatureLoss
 from src.utils.helper import merge_img_label_gt_simplified
 
 
@@ -23,6 +25,8 @@ class OctreeNCADualViewWarmStartM1InitAgent(MedNCAAgent):
         self.accum_iter = 0
         self._warned_no_supervision = False
         self._temporal_consistency_loss_fn = TemporalConsistencyLoss()
+        self._contractive_reg_fn = ContractiveRegularization(n_probes=1, probe_dist="rademacher")
+        self._latent_sfa_loss_fn = LatentSlowFeatureLoss()
 
     def _as_device_tensor(self, x):
         if x is None:
@@ -94,6 +98,23 @@ class OctreeNCADualViewWarmStartM1InitAgent(MedNCAAgent):
         # --- Temporal consistency loss weight ---
         tc_weight = float(self.exp.config.get("trainer.temporal_consistency_weight", 0.0))
 
+        # --- Contractive regularization weight ---
+        contractive_weight = float(self.exp.config.get("trainer.contractive_weight", 0.0))
+
+        # --- Motion-weighted loss ---
+        # Upweight frames where the GT label changes significantly relative to the
+        # previous frame.  This counteracts the identity attractor that forms when
+        # consecutive frames in high-FPS video are nearly identical.
+        #   frame_weight = 1 + motion_loss_weight * changed_pixel_fraction
+        # Set trainer.motion_loss_weight = 0 (default) to disable.
+        motion_loss_weight = float(self.exp.config.get("trainer.motion_loss_weight", 0.0))
+
+        # --- Latent SFA weight and decorrelation strength ---
+        latent_sfa_weight = float(self.exp.config.get("trainer.latent_sfa_weight", 0.0))
+        latent_sfa_decorr_weight = float(
+            self.exp.config.get("trainer.latent_sfa_decorrelation_weight", 1.0)
+        )
+
         # --- Curriculum schedule: compute effective sequence length ---
         cur_epoch = getattr(self, "_current_epoch", 0) or 0
         seq_len_min = int(self.exp.config.get("trainer.curriculum.seq_len_min", 0))
@@ -157,6 +178,15 @@ class OctreeNCADualViewWarmStartM1InitAgent(MedNCAAgent):
         total_supervised_steps = max(0, time_steps - start_t) + (1 if supervised_t0 else 0)
         steps = 0
         prev_hidden = None  # for temporal consistency loss
+
+        # Initialise previous GT labels for motion-weight computation.
+        # We compare y_t vs y_{t-1} to measure how much the segmentation changed.
+        if motion_loss_weight > 0.0 and start_t > 0:
+            _prev_y_a_motion = y_a_seq[:, start_t - 1]  # (B, C, H, W)
+            _prev_y_b_motion = y_b_seq[:, start_t - 1]
+        else:
+            _prev_y_a_motion = None
+            _prev_y_b_motion = None
 
         def _accumulate_loss(loss_tensor: torch.Tensor):
             nonlocal loss_val, chunk_loss
@@ -293,13 +323,31 @@ class OctreeNCADualViewWarmStartM1InitAgent(MedNCAAgent):
                     prev_state_b = out["final_state_b"].detach()
                 continue
 
+            # --- Motion-weighted loss: scale by GT-change fraction ---
+            if motion_loss_weight > 0.0:
+                if _prev_y_a_motion is not None:
+                    with torch.no_grad():
+                        prev_cls_a = _prev_y_a_motion.argmax(dim=1)  # (B, H, W)
+                        curr_cls_a = y_a_t.argmax(dim=1)
+                        prev_cls_b = _prev_y_b_motion.argmax(dim=1)
+                        curr_cls_b = y_b_t.argmax(dim=1)
+                        changed_frac = torch.cat(
+                            [prev_cls_a != curr_cls_a, prev_cls_b != curr_cls_b], dim=0
+                        ).float().mean().item()
+                    frame_motion_weight = 1.0 + motion_loss_weight * changed_frac
+                    l = l * frame_motion_weight
+                    loss_ret["motion_weight"] = loss_ret.get("motion_weight", 0.0) + frame_motion_weight
+                _prev_y_a_motion = y_a_t
+                _prev_y_b_motion = y_b_t
+
             _accumulate_loss(l)
             steps += 1
 
-            # --- Temporal consistency loss on hidden states ---
-            if tc_weight > 0.0 and "hidden_channels" in out:
+            if "hidden_channels" in out:
                 hidden_t = out["hidden_channels"]
-                if prev_hidden is not None:
+
+                # --- Temporal consistency loss on hidden states ---
+                if tc_weight > 0.0 and prev_hidden is not None:
                     tc_loss, tc_dict = self._temporal_consistency_loss_fn(hidden_t, prev_hidden)
                     _accumulate_loss(tc_loss * tc_weight)
                     for k, v in tc_dict.items():
@@ -307,7 +355,40 @@ class OctreeNCADualViewWarmStartM1InitAgent(MedNCAAgent):
                         if full_key not in loss_ret:
                             loss_ret[full_key] = 0
                         loss_ret[full_key] += v * tc_weight
-                prev_hidden = hidden_t.detach()
+
+                # --- Latent SFA: slow features + decorrelation ---
+                if latent_sfa_weight > 0.0 and prev_hidden is not None:
+                    sfa_loss, sfa_dict = self._latent_sfa_loss_fn(
+                        hidden_t,
+                        prev_hidden,
+                        decorrelation_weight=latent_sfa_decorr_weight,
+                    )
+                    _accumulate_loss(sfa_loss * latent_sfa_weight)
+                    for k, v in sfa_dict.items():
+                        full_key = f"LatentSFA/{k}"
+                        if full_key not in loss_ret:
+                            loss_ret[full_key] = 0
+                        loss_ret[full_key] += v * latent_sfa_weight
+
+                if tc_weight > 0.0 or latent_sfa_weight > 0.0:
+                    prev_hidden = hidden_t.detach()
+
+            # --- Contractive regularization on NCA update Jacobian ---
+            if (
+                contractive_weight > 0.0
+                and "_contractive_pre_hidden" in out
+                and "_contractive_post_hidden" in out
+            ):
+                cr_loss, cr_dict = self._contractive_reg_fn(
+                    output_hidden=out["_contractive_post_hidden"],
+                    input_hidden=out["_contractive_pre_hidden"],
+                )
+                _accumulate_loss(cr_loss * contractive_weight)
+                for k, v in cr_dict.items():
+                    full_key = f"ContractiveReg/{k}"
+                    if full_key not in loss_ret:
+                        loss_ret[full_key] = 0
+                    loss_ret[full_key] += v * contractive_weight
 
             step_loss_ret = {}
             for key, value in l_dict.items():

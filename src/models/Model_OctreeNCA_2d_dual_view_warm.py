@@ -14,9 +14,23 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
     - Injects current image channels into the carried state.
     - Supports optional logits reset/gating and hidden stabilization.
     - Returns final states for the next frame rollout.
+    - Optionally injects a per-pixel frame-difference map as an extra
+      input channel (``model.octree.warm_start_frame_diff_input``).
     """
 
     def __init__(self, config: dict):
+        # ── Frame-difference input channel ───────────────────────────────
+        # When enabled, an extra input channel is added that holds the
+        # per-pixel intensity difference (current − previous frame).
+        # This gives the NCA explicit temporal-change information.
+        self.frame_diff_input = bool(
+            config.get("model.octree.warm_start_frame_diff_input", False)
+        )
+        self._orig_input_channels = int(config.get("model.input_channels", 1))
+        if self.frame_diff_input:
+            config = dict(config)  # shallow copy so we don't mutate the caller's dict
+            config["model.input_channels"] = self._orig_input_channels + 1
+
         super().__init__(config)
 
         self.warm_start_steps = config.get("model.octree.warm_start_steps", self.inference_steps[0])
@@ -124,6 +138,41 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
                 "model.octree.warm_start_temporal_gate must be one of: "
                 "'gru', 'simple', 'none'."
             )
+
+    # ── Frame-difference injection helper ────────────────────────────
+
+    def _inject_image_and_diff(
+        self,
+        state: torch.Tensor,
+        x: torch.Tensor,
+        prev_state: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Inject image (and optionally frame-diff) into the input channels.
+
+        Args:
+            state: (B, C, H, W) NCA state tensor — modified **in-place**.
+            x: (B, C_img, H, W) current input image
+               (``C_img == _orig_input_channels``, typically 1 for grayscale).
+            prev_state: (B, C, H, W) previous NCA state.  If *None* (cold
+               start / first frame), the difference channel is filled with
+               zeros.
+
+        Returns:
+            The (possibly modified) *state* tensor.
+        """
+        oc = self._orig_input_channels
+        if self.frame_diff_input:
+            # Compute diff BEFORE overwriting the image channel, because
+            # prev_state may alias state (e.g. in multiscale warm-start).
+            if prev_state is not None:
+                diff = x[:, :oc] - prev_state[:, :oc]
+            else:
+                diff = torch.zeros_like(x[:, :oc])
+            state[:, :oc] = x[:, :oc]
+            state[:, oc:oc + oc] = diff
+        else:
+            state[:, :oc] = x[:, :oc]
+        return state
 
     def _run_backbone_with_steps(self, x_bchw: torch.Tensor, level: int, steps: int):
         old_steps = self.inference_steps[level]
@@ -260,14 +309,12 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         return torch.cat([left, hidden], dim=1)
 
     def _forward_cold(self, x_a: torch.Tensor, x_b: torch.Tensor):
-        input_ch = self.input_channels
-
         state_a = x_a.new_zeros((x_a.shape[0], self.channel_n, *self.octree_res[-1]))
         state_b = x_b.new_zeros((x_b.shape[0], self.channel_n, *self.octree_res[-1]))
         xa_coarse = self.downscale(x_a, -1, layout="BCHW")
         xb_coarse = self.downscale(x_b, -1, layout="BCHW")
-        state_a[:, :input_ch] = xa_coarse[:, :input_ch]
-        state_b[:, :input_ch] = xb_coarse[:, :input_ch]
+        self._inject_image_and_diff(state_a, xa_coarse, prev_state=None)
+        self._inject_image_and_diff(state_b, xb_coarse, prev_state=None)
 
         for level in range(len(self.octree_res) - 1, -1, -1):
             state_ab = torch.cat([state_a, state_b], dim=0)
@@ -284,8 +331,9 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
 
                 inj_a = self.downscale(x_a, level - 1, layout="BCHW")
                 inj_b = self.downscale(x_b, level - 1, layout="BCHW")
-                state_a[:, :input_ch] = inj_a[:, :input_ch]
-                state_b[:, :input_ch] = inj_b[:, :input_ch]
+                # Cold start: no previous frame, diff = 0
+                self._inject_image_and_diff(state_a, inj_a, prev_state=None)
+                self._inject_image_and_diff(state_b, inj_b, prev_state=None)
 
         return state_a, state_b
 
@@ -313,6 +361,7 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         prev_state_b: torch.Tensor,
     ):
         input_ch = self.input_channels
+        hidden_start = input_ch + self.output_channels
         state_a = prev_state_a.clone()
         state_b = prev_state_b.clone()
 
@@ -320,8 +369,9 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         state_a = self._reset_spatial_channels(state_a)
         state_b = self._reset_spatial_channels(state_b)
 
-        state_a[:, :input_ch] = x_a[:, :input_ch]
-        state_b[:, :input_ch] = x_b[:, :input_ch]
+        # Inject current image (and per-pixel diff from previous frame)
+        self._inject_image_and_diff(state_a, x_a, prev_state=prev_state_a)
+        self._inject_image_and_diff(state_b, x_b, prev_state=prev_state_b)
 
         state_a = self._init_logits_for_warm_start_bchw(state_a)
         state_b = self._init_logits_for_warm_start_bchw(state_b)
@@ -331,6 +381,18 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         # Inject noise into hidden channels (training-time only, annealed)
         state_a = self._inject_hidden_noise(state_a)
         state_b = self._inject_hidden_noise(state_b)
+
+        # Snapshot hidden channels BEFORE the backbone update for contractive
+        # regularization (Jacobian of update w.r.t. hidden input).  We keep
+        # them in the graph so autograd can trace through the backbone.
+        pre_update_hidden_ab = torch.cat(
+            [state_a[:, hidden_start:], state_b[:, hidden_start:]], dim=0
+        )
+        if self.training:
+            pre_update_hidden_ab.requires_grad_(True)
+            # Re-attach to the states so the backbone sees the grad-tracked version
+            state_a = torch.cat([state_a[:, :hidden_start], pre_update_hidden_ab[:state_a.shape[0]]], dim=1)
+            state_b = torch.cat([state_b[:, :hidden_start], pre_update_hidden_ab[state_a.shape[0]:]], dim=1)
 
         steps = int(self.warm_start_steps)
         state_ab = torch.cat([state_a, state_b], dim=0)
@@ -361,12 +423,18 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
             state_b = cand_state_b
 
         # Keep current-frame input channels exact after temporal blending.
-        state_a[:, :input_ch] = x_a[:, :input_ch]
-        state_b[:, :input_ch] = x_b[:, :input_ch]
+        self._inject_image_and_diff(state_a, x_a, prev_state=prev_state_a)
+        self._inject_image_and_diff(state_b, x_b, prev_state=prev_state_b)
 
         state_a = self._stabilize_hidden_state_bchw(state_a)
         state_b = self._stabilize_hidden_state_bchw(state_b)
-        return state_a, state_b
+
+        # Post-update hidden channels (in graph) for contractive regularization
+        post_update_hidden_ab = torch.cat(
+            [state_a[:, hidden_start:], state_b[:, hidden_start:]], dim=0
+        )
+
+        return state_a, state_b, pre_update_hidden_ab, post_update_hidden_ab
 
     def _forward_warm_multiscale(
         self,
@@ -414,8 +482,10 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         state_b = self._reset_spatial_channels(state_b)
 
         input_ch = self.input_channels
-        state_a[:, :input_ch] = inputs_a[start_level][:, :input_ch]
-        state_b[:, :input_ch] = inputs_b[start_level][:, :input_ch]
+        # For multiscale warm-start, inject image + diff at the start level.
+        # prev_state was (possibly) downsampled, so use it as-is for the diff.
+        self._inject_image_and_diff(state_a, inputs_a[start_level], prev_state=prev_state_a if start_level == 0 else state_a)
+        self._inject_image_and_diff(state_b, inputs_b[start_level], prev_state=prev_state_b if start_level == 0 else state_b)
         state_a = self._init_logits_for_warm_start_bchw(state_a)
         state_b = self._init_logits_for_warm_start_bchw(state_b)
         state_a = self._stabilize_hidden_state_bchw(state_a)
@@ -423,8 +493,11 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
 
         for level in range(start_level, -1, -1):
             if level != start_level:
-                state_a[:, :input_ch] = inputs_a[level][:, :input_ch]
-                state_b[:, :input_ch] = inputs_b[level][:, :input_ch]
+                # Re-inject image at finer resolution.  We don't have the
+                # previous frame's image at this intermediate resolution,
+                # so the diff channel is set to zero.
+                self._inject_image_and_diff(state_a, inputs_a[level], prev_state=None)
+                self._inject_image_and_diff(state_b, inputs_b[level], prev_state=None)
 
             steps = int(steps_per_level[level])
             if steps > 0:
@@ -451,6 +524,8 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         state_b: torch.Tensor,
         y_a: torch.Tensor,
         y_b: torch.Tensor,
+        pre_update_hidden: torch.Tensor = None,
+        post_update_hidden: torch.Tensor = None,
     ):
         input_ch = self.input_channels
 
@@ -479,6 +554,11 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
         }
         if self.apply_nonlin is not None:
             ret_dict["probabilities"] = self.apply_nonlin(logits)
+        # Contractive regularization tensors (kept in BCHW for Jacobian computation)
+        if pre_update_hidden is not None:
+            ret_dict["_contractive_pre_hidden"] = pre_update_hidden
+        if post_update_hidden is not None:
+            ret_dict["_contractive_post_hidden"] = post_update_hidden
         return ret_dict
 
     def forward(
@@ -549,6 +629,9 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
                 prev_state_a = torch.cat([prev_state_a] * batch_duplication, dim=0)
                 prev_state_b = torch.cat([prev_state_b] * batch_duplication, dim=0)
 
+        pre_update_hidden = None
+        post_update_hidden = None
+
         if prev_state_a is None:
             state_a, state_b = self._forward_cold(x_a, x_b)
         else:
@@ -560,9 +643,14 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
             if self.warm_start_multiscale:
                 state_a, state_b = self._forward_warm_multiscale(x_a, x_b, prev_state_a, prev_state_b)
             else:
-                state_a, state_b = self._forward_warm_single_scale(x_a, x_b, prev_state_a, prev_state_b)
+                state_a, state_b, pre_update_hidden, post_update_hidden = \
+                    self._forward_warm_single_scale(x_a, x_b, prev_state_a, prev_state_b)
 
-        return self._pack_outputs(state_a, state_b, y_a, y_b)
+        return self._pack_outputs(
+            state_a, state_b, y_a, y_b,
+            pre_update_hidden=pre_update_hidden,
+            post_update_hidden=post_update_hidden,
+        )
 
     @torch.no_grad()
     def forward_eval(

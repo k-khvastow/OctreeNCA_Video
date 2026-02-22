@@ -852,6 +852,10 @@ class BaseAgent():
                     else:
                         loss_log[key].append(loss_item[key].detach())
 
+                # Flush buffered wandb metrics once per training step so that
+                # wandb's internal _step stays in sync with global_step.
+                self.exp.flush_wandb()
+
                 if timing_enabled:
                     iter_end = time.perf_counter()
 
@@ -937,6 +941,8 @@ class BaseAgent():
                 print("Model saved")
                 self.save_state(os.path.join(pc.FILER_BASE_PATH, self.exp.get_from_config('experiment.model_path'), 'models', 'epoch_' + str(self.exp.currentStep)))
             self.conclude_epoch()
+            # Flush any remaining buffered wandb metrics for this epoch.
+            self.exp.flush_wandb()
             self.exp.increase_epoch()
 
     def prepare_image_for_display(self, image: torch.Tensor) -> torch.Tensor:
