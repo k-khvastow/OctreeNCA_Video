@@ -605,11 +605,11 @@ def main():
     parser.add_argument("--keyframe-interval", type=int, default=None,
                         help="M1 keyframe interval (default: from config)")
     parser.add_argument("--data-root",
-                        default="/vol/data/OctreeNCA_Video/ioct_data",
+                        default="/home/khvastow/ioct_data",
                         help="iOCT data root directory")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     # ── Load model ───────────────────────────────────────────────────────

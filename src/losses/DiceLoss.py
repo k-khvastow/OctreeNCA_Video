@@ -192,9 +192,22 @@ class nnUNetSoftDiceLossSum(nnUNetSoftDiceLoss):
 
 class GeneralizedDiceLoss(torch.nn.Module):
     """
-    Generalized Dice Loss with inverse-squared volume weights.
+    Generalized Dice Loss with inverse volume weights.
+
+    Parameters
+    ----------
+    weight_type : str
+        ``"v2"`` — original 1/g² (Sudre et al., 2017).
+        ``"v1"`` — 1/g  (less aggressive; better for very thin classes).
+        ``"uniform"`` — no class weighting (falls back to standard Dice).
+    max_weight : float or None
+        If set, clamp per-class weights to this value so that no single
+        rare class can dominate the loss.  Useful when some classes have
+        only a handful of pixels.  A good starting point is 100–1000.
     """
-    def __init__(self, apply_nonlin=None, batch_dice=False, do_bg=True, smooth=1., weight_eps=1e-6):
+    def __init__(self, apply_nonlin=None, batch_dice=False, do_bg=True,
+                 smooth=1., weight_eps=1e-6,
+                 weight_type="v2", max_weight=None):
         super().__init__()
         self.do_bg = do_bg
         self.batch_dice = batch_dice
@@ -204,6 +217,10 @@ class GeneralizedDiceLoss(torch.nn.Module):
             self.apply_nonlin = None
         self.smooth = smooth
         self.weight_eps = weight_eps
+        assert weight_type in ("v1", "v2", "uniform"), \
+            f"weight_type must be 'v1', 'v2', or 'uniform', got '{weight_type}'"
+        self.weight_type = weight_type
+        self.max_weight = max_weight
 
     def _to_bchw(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.dim() == 4:
@@ -215,6 +232,26 @@ class GeneralizedDiceLoss(torch.nn.Module):
             if tensor.shape[-1] < tensor.shape[1]:
                 return einops.rearrange(tensor, "b h w d c -> b c h w d")
         return tensor
+
+    def _compute_weights(self, g_sum: torch.Tensor) -> torch.Tensor:
+        """Per-class weights from ground-truth volumes ``g_sum``."""
+        if self.weight_type == "uniform":
+            return torch.ones_like(g_sum)
+        elif self.weight_type == "v1":
+            weights = torch.where(
+                g_sum > 0,
+                1.0 / (g_sum + self.weight_eps),
+                torch.zeros_like(g_sum),
+            )
+        else:  # v2 — original GDL
+            weights = torch.where(
+                g_sum > 0,
+                1.0 / (g_sum * g_sum + self.weight_eps),
+                torch.zeros_like(g_sum),
+            )
+        if self.max_weight is not None:
+            weights = weights.clamp(max=self.max_weight)
+        return weights
 
     def forward(self, x=None, y=None, loss_mask=None, logits=None, target=None, logits_cf=None, target_cf=None, **kwargs):
         if x is None:
@@ -247,11 +284,7 @@ class GeneralizedDiceLoss(torch.nn.Module):
 
         # Class volumes from gt: sum_i g_ci = tp + fn
         g_sum = tp + fn
-        weights = torch.where(
-            g_sum > 0,
-            1.0 / (g_sum * g_sum + self.weight_eps),
-            torch.zeros_like(g_sum),
-        )
+        weights = self._compute_weights(g_sum)
 
         if not self.do_bg:
             if self.batch_dice:
