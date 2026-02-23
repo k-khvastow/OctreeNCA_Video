@@ -419,8 +419,10 @@ class OctreeNCA2DDualViewWarmStart(OctreeNCA2DDualView):
             state_b[:, hidden_start:] = (1.0 - z_b) * prev_state_b[:, hidden_start:] + z_b * cand_state_b[:, hidden_start:]
         else:
             # No temporal gate – candidate state is used directly.
-            state_a = cand_state_a
-            state_b = cand_state_b
+            # Clone because cand_state_{a,b} are views from chunk() and
+            # _inject_image_and_diff does inplace slice assignment.
+            state_a = cand_state_a.clone()
+            state_b = cand_state_b.clone()
 
         # Keep current-frame input channels exact after temporal blending.
         self._inject_image_and_diff(state_a, x_a, prev_state=prev_state_a)
