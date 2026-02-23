@@ -45,6 +45,13 @@ MODEL_PATH = ("<path>/<path>/octree_study_new/Experiments/"
 
 OUTPUT_CSV = "eval_results_octree.csv"
 
+# data_split.pkl saved by the training experiment — use the 'test' split
+DATA_SPLIT_PKL = (
+    "<path>/<path>/octree_study_new/Experiments/"
+    "iOCT2D_dual_dispute_32_Dual-view iOCT (A+B) OctreeNCA segmentation."
+    "/data_split.pkl"
+)
+
 DATASETS   = ["peeling", "sri"]
 VIEWS      = ["A", "B"]          # view_a=A, view_b=B
 
@@ -226,6 +233,19 @@ def collect_pairs(data_root: str, datasets: list, views: list) -> list:
             })
 
     return pairs
+
+
+def load_test_ids(split_pkl: str) -> set:
+    """
+    Load the test-set pair IDs from the experiment's data_split.pkl.
+    IDs have the form '{dataset}_{frame_stem}', e.g. 'peeling_01440'.
+    """
+    import pickle
+    with open(split_pkl, "rb") as f:
+        d = pickle.load(f)
+    ids = set(d["test"])
+    print(f"Loaded test split: {len(ids)} pairs from {split_pkl}")
+    return ids
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -423,14 +443,20 @@ def predict_pair(model: OctreeNCA2DDualView,
 #  Evaluation loop
 # ══════════════════════════════════════════════════════════════════════════════
 
-def evaluate(data_root: str, datasets: list, views: list, model_path: str):
+def evaluate(data_root: str, datasets: list, views: list, model_path: str, split_pkl: str = DATA_SPLIT_PKL):
     print(f"Device             : {DEVICE}")
     print(f"Loading model from : {model_path}")
     model = load_model(model_path)
 
     print(f"Collecting paired frames from: {data_root}")
-    pairs = collect_pairs(data_root, datasets, views)
-    print(f"Found {len(pairs)} paired frames ({views[0]}+{views[1]})\n")
+    all_pairs = collect_pairs(data_root, datasets, views)
+    if split_pkl is not None:
+        test_ids = load_test_ids(split_pkl)
+        pairs    = [p for p in all_pairs if p["id"] in test_ids]
+        print(f"Found {len(all_pairs)} total paired frames — keeping {len(pairs)} test pairs ({views[0]}+{views[1]})\n")
+    else:
+        pairs = all_pairs
+        print(f"No split file provided — evaluating all {len(pairs)} pairs ({views[0]}+{views[1]})\n")
 
     accumulator_a = GlobalAccumulator(N_CLASSES)
     accumulator_b = GlobalAccumulator(N_CLASSES)
@@ -492,50 +518,197 @@ def evaluate(data_root: str, datasets: list, views: list, model_path: str):
                                    sc_b["global_iou_per_class"].get(c, 0)])
                       for c in all_classes}
 
-    # ── Per-image macro average ───────────────────────────────────────────────
-    print("Per-image macro average (matches DiceScore / IoUScore):")
+    _print_results(agg, global_iou, global_dice, global_iou_pc, global_dice_pc,
+                   sc_a, sc_b, views, all_classes)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Output: console tables + LaTeX
+# ══════════════════════════════════════════════════════════════════════════════
+
+CLASS_NAMES = {c: f"Class {c}" for c in range(N_CLASSES)}
+
+
+def _fmt(v: float, pct: bool = True) -> str:
+    """Format a metric value as percentage with 1 decimal place."""
+    return f"{v * 100:.1f}"
+
+
+def _print_results(
+    agg: dict,
+    global_iou: float,
+    global_dice: float,
+    global_iou_pc: dict,
+    global_dice_pc: dict,
+    sc_a: dict,
+    sc_b: dict,
+    views: list,
+    all_classes: list,
+) -> None:
+    pa_arr   = np.array(agg["pa"])
+    iou_arr  = np.array(agg["iou"])
+    dice_arr = np.array(agg["dice"])
+    bf1_arr  = np.array(agg["bf1"])
+
+    # ── Console: per-image macro average ─────────────────────────────────────
+    print("\nPer-image macro average (test set):")
     rows1 = []
-    for label, fn in [("MEAN", np.mean), ("STD", np.std),
-                      ("MIN",  np.min),  ("MAX", np.max)]:
-        rows1.append([label, f"{fn(agg['pa']):.4f}", f"{fn(agg['iou']):.4f}",
-                      f"{fn(agg['dice']):.4f}", f"{fn(agg['bf1']):.4f}"])
+    for label, fn in [("Mean", np.mean), ("Std", np.std),
+                      ("Min",  np.min),  ("Max", np.max)]:
+        rows1.append([label,
+                      f"{fn(pa_arr)*100:.2f}%",
+                      f"{fn(iou_arr)*100:.2f}%",
+                      f"{fn(dice_arr)*100:.2f}%",
+                      f"{fn(bf1_arr)*100:.2f}%"])
     print(tabulate(rows1, headers=["", "Pixel Acc", "IoU", "Dice", "Boundary F1"],
                    tablefmt="rounded_outline"))
 
-    # ── Global aggregate ─────────────────────────────────────────────────────
-    print("\nGlobal aggregate (matches PatchwiseDiceScore / PatchwiseIoUScore):")
-    print(tabulate([["ALL FRAMES", f"{global_iou:.4f}", f"{global_dice:.4f}"]],
+    # ── Console: global aggregate ─────────────────────────────────────────────
+    print("\nGlobal aggregate (test set):")
+    print(tabulate([["All frames",
+                     f"{global_iou*100:.2f}%",
+                     f"{global_dice*100:.2f}%"]],
                    headers=["", "Global IoU", "Global Dice"],
                    tablefmt="rounded_outline"))
 
-    # ── Per-class global scores ───────────────────────────────────────────────
-    print("\nPer-class global scores (foreground classes only):")
-    class_rows = [[f"Class {c}",
-                   f"{global_iou_pc[c]:.4f}",
-                   f"{global_dice_pc[c]:.4f}"] for c in all_classes]
+    # ── Console: per-class breakdown ──────────────────────────────────────────
+    print("\nPer-class global scores (foreground only):")
+    class_rows = [[CLASS_NAMES.get(c, f"Class {c}"),
+                   f"{global_iou_pc[c]*100:.2f}%",
+                   f"{global_dice_pc[c]*100:.2f}%"] for c in all_classes]
     print(tabulate(class_rows, headers=["Class", "Global IoU", "Global Dice"],
                    tablefmt="rounded_outline"))
 
-    # ── Per-view breakdown ────────────────────────────────────────────────────
+    # ── Console: per-view breakdown ───────────────────────────────────────────
     print("\nPer-view global breakdown:")
     view_rows = [
-        [f"View {views[0]}", f"{sc_a['global_iou']:.4f}", f"{sc_a['global_dice']:.4f}"],
-        [f"View {views[1]}", f"{sc_b['global_iou']:.4f}", f"{sc_b['global_dice']:.4f}"],
+        [f"View {views[0]}",
+         f"{sc_a['global_iou']*100:.2f}%",
+         f"{sc_a['global_dice']*100:.2f}%"],
+        [f"View {views[1]}",
+         f"{sc_b['global_iou']*100:.2f}%",
+         f"{sc_b['global_dice']*100:.2f}%"],
     ]
     print(tabulate(view_rows, headers=["", "Global IoU", "Global Dice"],
                    tablefmt="rounded_outline"))
 
+    # ── LaTeX tables ──────────────────────────────────────────────────────────
+    latex = _build_latex(agg, global_iou, global_dice, global_iou_pc, global_dice_pc,
+                         sc_a, sc_b, views, all_classes)
+    print("\n" + "=" * 70)
+    print("LaTeX tables")
+    print("=" * 70)
+    print(latex)
 
-# ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+def _build_latex(
+    agg: dict,
+    global_iou: float,
+    global_dice: float,
+    global_iou_pc: dict,
+    global_dice_pc: dict,
+    sc_a: dict,
+    sc_b: dict,
+    views: list,
+    all_classes: list,
+) -> str:
+    pa_arr   = np.array(agg["pa"])
+    iou_arr  = np.array(agg["iou"])
+    dice_arr = np.array(agg["dice"])
+    bf1_arr  = np.array(agg["bf1"])
+
+    lines = []
+
+    # ── Table 1: Overall summary ──────────────────────────────────────────────
+    lines += [
+        r"% ── Table 1: Overall metrics (test set) ────────────────────────────",
+        r"\begin{table}[h]",
+        r"  \centering",
+        r"  \caption{OctreeNCA dual-view segmentation metrics on the test set "
+        r"(per-frame macro average $\pm$ std).}",
+        r"  \label{tab:octree_overall}",
+        r"  \begin{tabular}{lcccc}",
+        r"    \toprule",
+        r"    & Pixel Acc (\%) & IoU (\%) & Dice (\%) & Boundary F1 (\%) \\\\",
+        r"    \midrule",
+        f"    Mean & {_fmt(np.mean(pa_arr))} & {_fmt(np.mean(iou_arr))} "
+        f"& {_fmt(np.mean(dice_arr))} & {_fmt(np.mean(bf1_arr))} \\\\",
+        f"    Std  & {_fmt(np.std(pa_arr))}  & {_fmt(np.std(iou_arr))}  "
+        f"& {_fmt(np.std(dice_arr))}  & {_fmt(np.std(bf1_arr))}  \\\\",
+        f"    Min  & {_fmt(np.min(pa_arr))}  & {_fmt(np.min(iou_arr))}  "
+        f"& {_fmt(np.min(dice_arr))}  & {_fmt(np.min(bf1_arr))}  \\\\",
+        f"    Max  & {_fmt(np.max(pa_arr))}  & {_fmt(np.max(iou_arr))}  "
+        f"& {_fmt(np.max(dice_arr))}  & {_fmt(np.max(bf1_arr))}  \\\\",
+        r"    \midrule",
+        f"    Global IoU & \\multicolumn{{4}}{{c}}{{{_fmt(global_iou)}\\%}} \\\\",
+        f"    Global Dice & \\multicolumn{{4}}{{c}}{{{_fmt(global_dice)}\\%}} \\\\",
+        r"    \bottomrule",
+        r"  \end{tabular}",
+        r"\end{table}",
+        "",
+    ]
+
+    # ── Table 2: Per-class breakdown ──────────────────────────────────────────
+    lines += [
+        r"% ── Table 2: Per-class global scores (foreground, test set) ─────────",
+        r"\begin{table}[h]",
+        r"  \centering",
+        r"  \caption{Per-class global IoU and Dice on the test set "
+        r"(foreground classes only).}",
+        r"  \label{tab:octree_per_class}",
+        r"  \begin{tabular}{lcc}",
+        r"    \toprule",
+        r"    Class & Global IoU (\%) & Global Dice (\%) \\\\",
+        r"    \midrule",
+    ]
+    for c in all_classes:
+        name = CLASS_NAMES.get(c, f"Class {c}")
+        lines.append(
+            f"    {name} & {_fmt(global_iou_pc[c])} & {_fmt(global_dice_pc[c])} \\\\"
+        )
+    # Macro mean row
+    mean_iou  = float(np.mean([global_iou_pc[c]  for c in all_classes]))
+    mean_dice = float(np.mean([global_dice_pc[c] for c in all_classes]))
+    lines += [
+        r"    \midrule",
+        f"    \\textbf{{Mean}} & \\textbf{{{_fmt(mean_iou)}}} "
+        f"& \\textbf{{{_fmt(mean_dice)}}} \\\\",
+        r"    \bottomrule",
+        r"  \end{tabular}",
+        r"\end{table}",
+        "",
+    ]
+
+    # ── Table 3: Per-view breakdown ───────────────────────────────────────────
+    lines += [
+        r"% ── Table 3: Per-view global scores (test set) ─────────────────────",
+        r"\begin{table}[h]",
+        r"  \centering",
+        r"  \caption{Per-view global IoU and Dice on the test set.}",
+        r"  \label{tab:octree_per_view}",
+        r"  \begin{tabular}{lcc}",
+        r"    \toprule",
+        r"    View & Global IoU (\%) & Global Dice (\%) \\\\",
+        r"    \midrule",
+        f"    View {views[0]} & {_fmt(sc_a['global_iou'])} "
+        f"& {_fmt(sc_a['global_dice'])} \\\\",
+        f"    View {views[1]} & {_fmt(sc_b['global_iou'])} "
+        f"& {_fmt(sc_b['global_dice'])} \\\\",
+        r"    \bottomrule",
+        r"  \end{tabular}",
+        r"\end{table}",
+    ]
+
+    return "\n".join(lines)
     parser = argparse.ArgumentParser(description="Evaluate OctreeNCA2DDualView segmentation metrics")
     parser.add_argument("--data-root", default=DATA_ROOT,   help="iOCT data root (contains peeling/, sri/)")
     parser.add_argument("--model",     default=MODEL_PATH,  help="Path to model.pth checkpoint")
     parser.add_argument("--datasets",  nargs="+", default=DATASETS, help="Dataset names (default: peeling sri)")
     parser.add_argument("--views",     nargs=2,   default=VIEWS,    help="Two view names (default: A B)")
     parser.add_argument("--output",    default=OUTPUT_CSV,           help="CSV output path")
+    parser.add_argument("--split",     default=DATA_SPLIT_PKL,       help="Path to data_split.pkl (use 'none' to eval all pairs)")
     args = parser.parse_args()
 
     OUTPUT_CSV = args.output
-    evaluate(args.data_root, args.datasets, args.views, args.model)
+    split_pkl  = None if args.split.lower() == "none" else args.split
+    evaluate(args.data_root, args.datasets, args.views, args.model, split_pkl=split_pkl)
