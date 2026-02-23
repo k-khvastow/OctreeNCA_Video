@@ -27,10 +27,13 @@ from src.utils.DistanceMaps import signed_distance_map
 # ---------------------------------------------------------------------------
 # Paths & constants
 # ---------------------------------------------------------------------------
-DATA_ROOT = "/vol/data/BioProject13/data_OCT/peeling3/iOCT/Bscan"
+DATA_ROOT = "/home/khvastow/ioct_data/canvas/peeling3/iOCT/Bscan"
 
-# Number of semantic classes in the segmentation masks (0-4 inclusive).
+# The segmentation masks in canvas/peeling3 use sparse class IDs
+# {0, 1, 2, 3, 4, 5, 8, 13}.  We only keep classes 0-4; anything
+# above 4 is mapped to background (0).
 NUM_CLASSES = 5
+MAX_VALID_CLASS = NUM_CLASSES - 1  # 4
 
 # Optional: train only a subset of foreground classes (background 0 is always kept).
 SELECTED_CLASSES = None  # e.g. [1, 2]
@@ -94,10 +97,21 @@ class Peeling3DualViewDataset(Dataset_Base):
         precompute_boundary_dist: bool = False,
         boundary_dist_classes=None,
         max_samples: int = None,
+        sparse_class_ids=None,
     ):
         super().__init__()
         self.data_root = Path(data_root)
         self.num_classes = num_classes
+
+        # Build a look-up table to remap sparse/non-contiguous mask ids
+        # to contiguous 0..N-1
+        self._remap_lut = None
+        if sparse_class_ids is not None:
+            max_id = max(sparse_class_ids)
+            lut = np.zeros(max_id + 1, dtype=np.uint8)
+            for new_id, old_id in enumerate(sparse_class_ids):
+                lut[old_id] = new_id
+            self._remap_lut = lut
         self.size = input_size
         self.precompute_boundary_dist = precompute_boundary_dist
         self.boundary_dist_classes = boundary_dist_classes
@@ -200,6 +214,13 @@ class Peeling3DualViewDataset(Dataset_Base):
             raise ValueError(
                 f"Segmentation shape {seg.shape} != expected {expected_size} for {seg_path}."
             )
+
+        # Clamp: any class id > MAX_VALID_CLASS becomes background (0)
+        seg[seg > MAX_VALID_CLASS] = 0
+
+        # Remap sparse class ids to contiguous 0..N-1
+        if self._remap_lut is not None:
+            seg = self._remap_lut[seg]
 
         # Remap classes if a subset was requested
         if self.class_map is not None:
