@@ -771,14 +771,14 @@ class Preset:
         # Resume handling
         resume_name = env_overrides.get("_resume.name", "")
         resume_path = env_overrides.get("_resume.model_path", "")
+        name_suffix = env_overrides.get("_exp.name_suffix", "").strip()
         if resume_name:
             config["experiment.name"] = resume_name
         else:
             r = wonderwords.RandomWord()
             random_word = r.word(include_parts_of_speech=["nouns"])
-            config["experiment.name"] = (
-                f"{self.name_prefix}_{random_word}_{config.get('model.channel_n', 24)}"
-            )
+            base_name = f"{self.name_prefix}_{random_word}_{config.get('model.channel_n', 24)}"
+            config["experiment.name"] = f"{base_name}_{name_suffix}" if name_suffix else base_name
         if resume_path:
             config["experiment.model_path"] = resume_path
 
@@ -820,7 +820,7 @@ class Preset:
 # iOCT dual-view dataset args builder
 # ═══════════════════════════════════════════════════════════════════════════
 
-_IOCT_DATA_ROOT = "/vol/data/OctreeNCA_Video/ioct_data"
+_IOCT_DATA_ROOT = os.environ.get("IOCT_DATA_ROOT", "/vol/data/OctreeNCA_Video/ioct_data").strip() or "/vol/data/OctreeNCA_Video/ioct_data"
 _IOCT_DATASETS = ["peeling", "sri"]
 _IOCT_VIEWS = ["A", "B"]
 
@@ -949,6 +949,26 @@ def _ioct_losses(
     use_boundary_loss: bool = False,
     boundary_loss_weight: float = 0.1,
     boundary_dist_clip: float = 20.0,
+    boundary_do_bg: bool = False,
+    boundary_use_probabilities: bool = False,
+    boundary_compute_missing_dist: bool = False,
+    dice_weight: float = 1.0,
+    focal_weight: float = 1.0,
+    focal_gamma: float = 2.0,
+    dice_smooth: float = 1e-5,
+    dice_batch_dice: bool = True,
+    dice_do_bg: bool = False,
+    focal_ignore_index: int = 0,
+    focal_reduction: str = "mean",
+    dice_type: str = "nnunet",
+    dice_weight_eps: float = 1e-6,
+    gdl_weight_type: str = "v2",
+    gdl_max_weight: float | None = None,
+    tversky_alpha: float = 0.3,
+    tversky_beta: float = 0.7,
+    tversky_gamma: float = 1.0,
+    tversky_smooth: float = 0.0,
+    tversky_ignore_index: int | None = None,
 ) -> dict[str, Any]:
     """Build the standard loss setup with auto-computed focal alpha.
 
@@ -973,24 +993,66 @@ def _ioct_losses(
         "FocalLoss/loss",
         "BoundaryLoss/loss",
         "nnUNetSoftDiceLossSum/overall",
-    ] + [f"nnUNetSoftDiceLossSum/mask_{i}" for i in range(max(0, num_classes - 1))]
+        "GeneralizedDiceLoss/overall",
+        "TverskyLoss/loss",
+    ] + [f"nnUNetSoftDiceLossSum/mask_{i}" for i in range(max(0, num_classes - 1))] \
+      + [f"GeneralizedDiceLoss/mask_{i}" for i in range(max(0, num_classes - 1))]
+
+    _dtype = dice_type.strip().lower()
+    _use_gdl = _dtype in ("generalized", "gdl", "generalised")
+    _use_tversky = _dtype in ("tversky",)
+    if _use_tversky:
+        dice_class = "src.losses.LossFunctions.TverskyLoss"
+        dice_params = {
+            "alpha": tversky_alpha,
+            "beta": tversky_beta,
+            "gamma": tversky_gamma,
+            "smooth": tversky_smooth,
+            "from_logits": True,
+            "reduction": "mean",
+        }
+        if tversky_ignore_index is not None:
+            dice_params["ignore_index"] = tversky_ignore_index
+        print(f"Dice loss: TverskyLoss (alpha={tversky_alpha}, beta={tversky_beta}, gamma={tversky_gamma})")
+    elif _use_gdl:
+        dice_class = "src.losses.DiceLoss.GeneralizedDiceLoss"
+        dice_params = {
+            "apply_nonlin": "torch.nn.Softmax(dim=1)",
+            "batch_dice": dice_batch_dice,
+            "do_bg": dice_do_bg,
+            "smooth": dice_smooth,
+            "weight_eps": dice_weight_eps,
+            "weight_type": gdl_weight_type,
+        }
+        if gdl_max_weight is not None:
+            dice_params["max_weight"] = gdl_max_weight
+        print(f"Dice loss: GeneralizedDiceLoss (weight_type={gdl_weight_type}, weight_eps={dice_weight_eps}, max_weight={gdl_max_weight})")
+    else:
+        dice_class = "src.losses.DiceLoss.nnUNetSoftDiceLossSum"
+        dice_params = {
+            "apply_nonlin": "torch.nn.Softmax(dim=1)",
+            "batch_dice": dice_batch_dice,
+            "do_bg": dice_do_bg,
+            "smooth": dice_smooth,
+        }
+        print(f"Dice loss: nnUNetSoftDiceLossSum")
 
     losses = [
-        "src.losses.DiceLoss.nnUNetSoftDiceLossSum",
+        dice_class,
         "src.losses.LossFunctions.FocalLoss",
     ]
     loss_params = [
-        {"apply_nonlin": "torch.nn.Softmax(dim=1)", "batch_dice": True, "do_bg": False, "smooth": 1e-05},
-        {"gamma": 2.0, "alpha": focal_alpha, "ignore_index": 0, "reduction": "mean"},
+        dice_params,
+        {"gamma": focal_gamma, "alpha": focal_alpha, "ignore_index": focal_ignore_index, "reduction": focal_reduction},
     ]
-    loss_weights = [1.0, 1.0]
+    loss_weights = [dice_weight, focal_weight]
 
     if use_boundary_loss:
         losses.append("src.losses.DiceLoss.BoundaryLoss")
         loss_params.append({
-            "do_bg": False, "channel_last": True, "use_precomputed": True,
-            "use_probabilities": False, "dist_clip": boundary_dist_clip,
-            "compute_missing_dist": False,
+            "do_bg": boundary_do_bg, "channel_last": True, "use_precomputed": True,
+            "use_probabilities": boundary_use_probabilities, "dist_clip": boundary_dist_clip,
+            "compute_missing_dist": boundary_compute_missing_dist,
         })
         loss_weights.append(boundary_loss_weight)
         print(f"BoundaryLoss enabled  (weight={boundary_loss_weight}, dist_clip={boundary_dist_clip})")

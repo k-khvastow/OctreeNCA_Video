@@ -64,6 +64,7 @@ def _int_or_range(val: str) -> int | tuple[int, int]:
 ENV_MAP: dict[str, tuple[str, Any]] = {
     # ── Experiment identity ──────────────────────────────────────────────
     "EXP_NAME":                     ("experiment.name", str),
+    "EXP_NAME_SUFFIX":              ("_exp.name_suffix", str),
     "EXP_DESCRIPTION":              ("experiment.description", str),
     "WANDB_PROJECT":                ("experiment.wandb_project", str),
     "WANDB_ENTITY":                 ("experiment.wandb_entity", str),

@@ -178,9 +178,24 @@ _ioct_m2_single_step_overrides: dict[str, Any] = {
 
 def _build_ioct_m2_single_step() -> Preset:
     import os
-    use_boundary = os.environ.get("BOUNDARY_LOSS", "0").strip() == "1"
-    boundary_weight = float(os.environ.get("BOUNDARY_LOSS_WEIGHT", "0.1").strip())
-    boundary_clip = float(os.environ.get("BOUNDARY_DIST_CLIP", "20.0").strip())
+    def _env(key, default): return os.environ.get(key, str(default)).strip() or str(default)
+    use_boundary    = _env("BOUNDARY_LOSS",       "0") == "1"
+    boundary_weight = float(_env("BOUNDARY_LOSS_WEIGHT", "0.1"))
+    boundary_clip   = float(_env("BOUNDARY_DIST_CLIP",   "20.0"))
+    dice_weight     = float(_env("DICE_LOSS_WEIGHT",  "1.0"))
+    focal_weight    = float(_env("FOCAL_LOSS_WEIGHT", "1.0"))
+    focal_gamma     = float(_env("FOCAL_GAMMA",       "2.0"))
+    dice_smooth     = float(_env("DICE_SMOOTH",       "1e-5"))
+    dice_batch_dice = _env("DICE_BATCH_DICE", "1") in ("1", "true", "yes")
+    dice_do_bg      = _env("DICE_DO_BG",      "0") in ("1", "true", "yes")
+    focal_ignore_index = int(_env("FOCAL_IGNORE_INDEX", "0"))
+    focal_reduction    = _env("FOCAL_REDUCTION",    "mean")
+    tversky_alpha       = float(_env("TVERSKY_ALPHA",       "0.3"))
+    tversky_beta        = float(_env("TVERSKY_BETA",        "0.7"))
+    tversky_gamma       = float(_env("TVERSKY_GAMMA",       "1.0"))
+    tversky_smooth      = float(_env("TVERSKY_SMOOTH",      "0.0"))
+    _tversky_ign_raw    = _env("TVERSKY_IGNORE_INDEX",  "")
+    tversky_ignore_idx  = int(_tversky_ign_raw) if _tversky_ign_raw else None
 
     overrides = dict(_ioct_m2_single_step_overrides)
     overrides.update(_ioct_losses(
@@ -188,6 +203,26 @@ def _build_ioct_m2_single_step() -> Preset:
         use_boundary_loss=use_boundary,
         boundary_loss_weight=boundary_weight,
         boundary_dist_clip=boundary_clip,
+        boundary_do_bg=_env("BOUNDARY_DO_BG", "0") in ("1", "true", "yes"),
+        boundary_use_probabilities=_env("BOUNDARY_USE_PROBABILITIES", "0") in ("1", "true", "yes"),
+        boundary_compute_missing_dist=_env("BOUNDARY_COMPUTE_MISSING_DIST", "0") in ("1", "true", "yes"),
+        dice_weight=dice_weight,
+        focal_weight=focal_weight,
+        focal_gamma=focal_gamma,
+        dice_smooth=dice_smooth,
+        dice_batch_dice=dice_batch_dice,
+        dice_do_bg=dice_do_bg,
+        focal_ignore_index=focal_ignore_index,
+        focal_reduction=focal_reduction,
+        dice_type=_env("DICE_TYPE", "nnunet"),
+        dice_weight_eps=float(_env("DICE_WEIGHT_EPS", "1e-6")),
+        gdl_weight_type=_env("GDL_WEIGHT_TYPE", "v2"),
+        gdl_max_weight=float(_env("GDL_MAX_WEIGHT", "0")) or None,
+        tversky_alpha=tversky_alpha,
+        tversky_beta=tversky_beta,
+        tversky_gamma=tversky_gamma,
+        tversky_smooth=tversky_smooth,
+        tversky_ignore_index=tversky_ignore_idx,
     ))
     # When boundary loss is active, dataset must precompute signed distance maps.
     if use_boundary:
