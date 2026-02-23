@@ -228,12 +228,12 @@ class UNet(nn.Module):
 
 CONFIG = {
     'project_name': 'iOCT_UNet_new',
-    'run_name': 'train_peeling1_test_2_3',
+    'run_name': 'train_peeling3_test_1_2',
     'data_path': '/vol/data/BioProject13/data_OCT',  
     'model_save_path': '/vol/data/OctreeNCA_Video/Models/iOCT_UNet_newdata',
     
-    'train_video': ['peeling1'],
-    'test_videos': ['peeling2', 'peeling3'],
+    'train_video': ['peeling3'],
+    'test_videos': ['peeling2', 'peeling1'],
     'val_split_ratio': 0.15,
 
     'seed': 42,
